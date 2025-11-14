@@ -70,7 +70,7 @@ npm install
 Crie um arquivo `.env` na raiz do projeto:
 ```env
 GEMINI_API_KEY=sua_chave_do_gemini_aqui
-NAMORADA_NUMBER=5582981566233@c.us
+NAMORADA_NUMBER=559999999999@c.us
 ```
 
 ### 4. Executar o bot
