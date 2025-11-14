@@ -2,6 +2,10 @@
 
 Bot do WhatsApp inteligente que responde automaticamente para sua namorada usando IA Gemini. Com sistema de personalização completo, backup automático, notificações e aprendizado adaptativo.
 
+###Minha opinião
+
+Esse Projeto não esta finalizado, Tem muita coisa para alterar e é bem personalizado, Comecei ele no mês 05/2025, não tive muito tempo para polir e ele tem alguns erros com o fallback, em minha opnião o gemini não é a melhor opção porem é gratuita, Tem muita coisa para personalizar e esse projeto vai mudar conforme o tempo, Aos poucos você percebe que você pode não ser tão romantico como a IA, pense como forma de se auto melhorar
+
 ## 🚀 Como usar
 
 ### 1. Instalar dependências
