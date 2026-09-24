@@ -1,14 +1,15 @@
 {
   "name": "whatsapp-personal-render",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Personal WhatsApp bridge using whatsapp-web.js for Render and ChatGPT/plugin integrations",
   "main": "src/server.js",
   "scripts": {
+    "postinstall": "PUPPETEER_CACHE_DIR=.cache/puppeteer npx puppeteer browsers install chrome",
     "start": "node src/server.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20 <25"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
