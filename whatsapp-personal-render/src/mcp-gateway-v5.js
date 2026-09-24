@@ -100,6 +100,17 @@ function textResult(value) {
   };
 }
 
+function audioResult(value) {
+  const { audioBase64, mimetype, ...meta } = value || {};
+  if (!audioBase64) return errorResult('Audio payload is empty');
+  return {
+    content: [
+      { type: 'audio', data: audioBase64, mimeType: mimetype || 'audio/ogg' },
+      { type: 'text', text: JSON.stringify(meta, null, 2) }
+    ]
+  };
+}
+
 function errorResult(message) {
   return {
     content: [{ type: 'text', text: String(message) }],
@@ -115,11 +126,9 @@ export async function startMcpGateway({ publicPort, internalPort }) {
 
   async function internalJson(pathname, options = {}) {
     if (!API_TOKEN) throw new Error('API_TOKEN is not configured on Render.');
-
     const headers = new Headers(options.headers || {});
     headers.set('authorization', `Bearer ${API_TOKEN}`);
     if (options.body && !headers.has('content-type')) headers.set('content-type', 'application/json');
-
     const response = await fetch(`${INTERNAL_BASE}${pathname}`, { ...options, headers });
     const text = await response.text();
     let data;
@@ -130,18 +139,13 @@ export async function startMcpGateway({ publicPort, internalPort }) {
 
   function authDescriptor(scopes) {
     const schemes = [{ type: 'oauth2', scopes }];
-    return {
-      securitySchemes: schemes,
-      _meta: { securitySchemes: schemes }
-    };
+    return { securitySchemes: schemes, _meta: { securitySchemes: schemes } };
   }
 
   function authFailure(requiredScopes) {
     const ctx = requestContext.getStore() || {};
-    const metadataUrl = ctx.metadataUrl
-      || `${String(process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '')}/.well-known/oauth-protected-resource`;
+    const metadataUrl = ctx.metadataUrl || `${String(process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '')}/.well-known/oauth-protected-resource`;
     const challenge = `Bearer resource_metadata=\"${metadataUrl}\", scope=\"${requiredScopes.join(' ')}\", error=\"insufficient_scope\", error_description=\"Connect your WhatsApp account to continue\"`;
-
     return {
       content: [{ type: 'text', text: 'Authentication required: connect your WhatsApp account to continue.' }],
       _meta: { 'mcp/www_authenticate': [challenge] },
@@ -156,7 +160,7 @@ export async function startMcpGateway({ publicPort, internalPort }) {
   }
 
   function createWhatsappMcpServer() {
-    const server = new McpServer({ name: 'meu-whatsapp', version: '1.5.0' });
+    const server = new McpServer({ name: 'meu-whatsapp', version: '1.6.0' });
 
     server.registerTool('whatsapp_status', {
       title: 'Status do WhatsApp',
@@ -186,7 +190,7 @@ export async function startMcpGateway({ publicPort, internalPort }) {
 
     server.registerTool('read_whatsapp_messages', {
       title: 'Ler mensagens do WhatsApp',
-      description: 'Lê mensagens recentes em cache de uma conversa específica pelo chatId.',
+      description: 'Lê mensagens recentes em cache de uma conversa. Mensagens de áudio incluem metadados audio.available, mimetype, seconds e ptt.',
       inputSchema: z.object({
         chatId: z.string().min(1),
         limit: z.number().int().min(1).max(100).default(30)
@@ -198,6 +202,29 @@ export async function startMcpGateway({ publicPort, internalPort }) {
       if (denied) return denied;
       try { return textResult(await internalJson(`/api/chats/${encodeURIComponent(chatId)}/messages?limit=${encodeURIComponent(limit)}`)); }
       catch (error) { return errorResult(error.message); }
+    });
+
+    server.registerTool('read_whatsapp_audio', {
+      title: 'Ouvir áudio do WhatsApp',
+      description: 'Baixa uma mensagem de voz/áudio do WhatsApp e a retorna como conteúdo de áudio MCP. Use chatId e messageId obtidos em read_whatsapp_messages.',
+      inputSchema: z.object({
+        chatId: z.string().min(1).describe('JID da conversa, por exemplo ...@s.whatsapp.net ou ...@g.us.'),
+        messageId: z.string().min(1).describe('ID da mensagem de áudio retornado por read_whatsapp_messages.')
+      }),
+      ...authDescriptor(['whatsapp.read']),
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+    }, async ({ chatId, messageId }) => {
+      const denied = requireToolAuth(['whatsapp.read']);
+      if (denied) return denied;
+      try {
+        const data = await internalJson('/api/audio', {
+          method: 'POST',
+          body: JSON.stringify({ chatId, messageId })
+        });
+        return audioResult(data);
+      } catch (error) {
+        return errorResult(error.message);
+      }
     });
 
     server.registerTool('search_whatsapp_messages', {
@@ -217,7 +244,7 @@ export async function startMcpGateway({ publicPort, internalPort }) {
       title: 'Enviar mensagem no WhatsApp',
       description: 'Envia uma única mensagem de texto pelo WhatsApp pessoal quando o usuário pedir explicitamente.',
       inputSchema: z.object({
-        to: z.string().min(1).describe('Número com DDI, por exemplo 5541999999999, ou JID do WhatsApp.'),
+        to: z.string().min(1).describe('Número com DDI ou JID do WhatsApp.'),
         message: z.string().min(1).max(5000)
       }),
       ...authDescriptor(['whatsapp.send']),
@@ -226,10 +253,7 @@ export async function startMcpGateway({ publicPort, internalPort }) {
       const denied = requireToolAuth(['whatsapp.send']);
       if (denied) return denied;
       try {
-        return textResult(await internalJson('/api/send', {
-          method: 'POST',
-          body: JSON.stringify({ to, message })
-        }));
+        return textResult(await internalJson('/api/send', { method: 'POST', body: JSON.stringify({ to, message }) }));
       } catch (error) {
         return errorResult(error.message);
       }
@@ -237,12 +261,12 @@ export async function startMcpGateway({ publicPort, internalPort }) {
 
     server.registerTool('send_whatsapp_image', {
       title: 'Enviar imagem no WhatsApp',
-      description: 'Envia uma imagem para um contato ou grupo do WhatsApp. Use imageUrl para uma URL pública ou imageBase64/data URL para conteúdo em base64. Pode incluir legenda.',
+      description: 'Envia uma imagem para contato ou grupo. O bridge normaliza a imagem para JPEG compatível antes de enviar. Use URL pública ou base64/data URL.',
       inputSchema: z.object({
         to: z.string().min(1).describe('Número com DDI ou JID do WhatsApp, incluindo grupos @g.us.'),
         imageUrl: z.string().url().optional().describe('URL pública http/https da imagem.'),
         imageBase64: z.string().optional().describe('Imagem em base64 puro ou data:image/...;base64,...'),
-        mimetype: z.string().optional().describe('MIME type quando imageBase64 não for data URL, por exemplo image/png.'),
+        mimetype: z.string().optional().describe('Mantido por compatibilidade; a imagem será normalizada para JPEG.'),
         caption: z.string().max(5000).optional().describe('Legenda opcional da imagem.')
       }),
       ...authDescriptor(['whatsapp.send']),
@@ -274,12 +298,7 @@ export async function startMcpGateway({ publicPort, internalPort }) {
 
   app.get('/.well-known/oauth-protected-resource', (req, res) => {
     const base = requestBaseUrl(req);
-    res.json({
-      resource: `${base}/mcp`,
-      authorization_servers: [base],
-      scopes_supported: OAUTH_SCOPES,
-      resource_documentation: `${base}/mcp-info`
-    });
+    res.json({ resource: `${base}/mcp`, authorization_servers: [base], scopes_supported: OAUTH_SCOPES, resource_documentation: `${base}/mcp-info` });
   });
 
   app.get('/.well-known/oauth-authorization-server', (req, res) => {
@@ -316,12 +335,8 @@ export async function startMcpGateway({ publicPort, internalPort }) {
     if (responseType !== 'code' || clientId !== CLIENT_ID || !allowedRedirect(redirectUri)) {
       return res.status(400).type('html').send('<h1>Solicitação OAuth inválida</h1>');
     }
-    if (!codeChallenge || codeChallengeMethod !== 'S256') {
-      return res.status(400).type('html').send('<h1>PKCE S256 é obrigatório</h1>');
-    }
-    if (resource && resource !== expectedResource) {
-      return res.status(400).type('html').send('<h1>Resource OAuth inválido</h1>');
-    }
+    if (!codeChallenge || codeChallengeMethod !== 'S256') return res.status(400).type('html').send('<h1>PKCE S256 é obrigatório</h1>');
+    if (resource && resource !== expectedResource) return res.status(400).type('html').send('<h1>Resource OAuth inválido</h1>');
 
     const hidden = {
       client_id: clientId,
@@ -333,7 +348,6 @@ export async function startMcpGateway({ publicPort, internalPort }) {
       scope: requestedScopes(scope).join(' '),
       resource: expectedResource
     };
-
     const hiddenInputs = Object.entries(hidden)
       .map(([key, value]) => `<input type=\"hidden\" name=\"${escapeHtml(key)}\" value=\"${escapeHtml(value)}\">`)
       .join('');
@@ -343,15 +357,10 @@ export async function startMcpGateway({ publicPort, internalPort }) {
 
   app.post('/oauth/authorize', express.urlencoded({ extended: false, limit: '64kb' }), (req, res) => {
     if (!LOGIN_SECRET) return res.status(503).type('html').send('<h1>Autenticação não configurada</h1>');
-
     const body = req.body || {};
     const base = requestBaseUrl(req);
-    if (body.client_id !== CLIENT_ID || !allowedRedirect(body.redirect_uri)) {
-      return res.status(400).type('html').send('<h1>Cliente OAuth inválido</h1>');
-    }
-    if (!safeEqual(body.access_key, LOGIN_SECRET)) {
-      return res.status(401).type('html').send('<h1>Chave inválida</h1><p>Volte e tente novamente.</p>');
-    }
+    if (body.client_id !== CLIENT_ID || !allowedRedirect(body.redirect_uri)) return res.status(400).type('html').send('<h1>Cliente OAuth inválido</h1>');
+    if (!safeEqual(body.access_key, LOGIN_SECRET)) return res.status(401).type('html').send('<h1>Chave inválida</h1><p>Volte e tente novamente.</p>');
 
     const code = randomToken(32);
     oauthCodes.set(code, {
@@ -362,7 +371,6 @@ export async function startMcpGateway({ publicPort, internalPort }) {
       resource: body.resource || `${base}/mcp`,
       expiresAt: Date.now() + AUTH_CODE_TTL_MS
     });
-
     const redirect = new URL(body.redirect_uri);
     redirect.searchParams.set('code', code);
     if (body.state) redirect.searchParams.set('state', body.state);
@@ -373,19 +381,12 @@ export async function startMcpGateway({ publicPort, internalPort }) {
 
   app.post('/oauth/token', express.urlencoded({ extended: false, limit: '64kb' }), (req, res) => {
     const body = req.body || {};
-    if (body.grant_type !== 'authorization_code') {
-      return res.status(400).json({ error: 'unsupported_grant_type' });
-    }
-
+    if (body.grant_type !== 'authorization_code') return res.status(400).json({ error: 'unsupported_grant_type' });
     const record = oauthCodes.get(body.code);
     oauthCodes.delete(body.code);
     if (!record || record.expiresAt < Date.now()) return res.status(400).json({ error: 'invalid_grant' });
-    if (record.clientId !== body.client_id || record.redirectUri !== body.redirect_uri) {
-      return res.status(400).json({ error: 'invalid_grant' });
-    }
-    if (body.resource && body.resource !== record.resource) {
-      return res.status(400).json({ error: 'invalid_target' });
-    }
+    if (record.clientId !== body.client_id || record.redirectUri !== body.redirect_uri) return res.status(400).json({ error: 'invalid_grant' });
+    if (body.resource && body.resource !== record.resource) return res.status(400).json({ error: 'invalid_target' });
 
     const verifier = String(body.code_verifier || '');
     const verifierHash = crypto.createHash('sha256').update(verifier).digest('base64url');
@@ -403,44 +404,27 @@ export async function startMcpGateway({ publicPort, internalPort }) {
       exp: now + ACCESS_TOKEN_TTL_SECONDS,
       scope: record.scope
     }, LOGIN_SECRET);
-
     console.log('[OAuth] access token issued');
     res.set('Cache-Control', 'no-store');
     res.set('Pragma', 'no-cache');
-    res.json({
-      access_token: token,
-      token_type: 'Bearer',
-      expires_in: ACCESS_TOKEN_TTL_SECONDS,
-      scope: record.scope
-    });
+    res.json({ access_token: token, token_type: 'Bearer', expires_in: ACCESS_TOKEN_TTL_SECONDS, scope: record.scope });
   });
 
   app.use('/mcp', (req, _res, next) => {
     const originalContentType = String(req.headers['content-type'] || '');
     const originalAccept = String(req.headers.accept || '');
-
     console.log(`[MCP] inbound ${req.method} content-type=\"${originalContentType || '(none)'}\" accept=\"${originalAccept || '(none)'}\"`);
-
     if (req.method === 'POST') {
       req.headers['content-type'] = 'application/json';
-
-      const accepts = originalAccept
-        .split(',')
-        .map(value => value.trim())
-        .filter(Boolean);
-      if (!accepts.some(value => value.toLowerCase().startsWith('application/json'))) {
-        accepts.push('application/json');
-      }
-      if (!accepts.some(value => value.toLowerCase().startsWith('text/event-stream'))) {
-        accepts.push('text/event-stream');
-      }
+      const accepts = originalAccept.split(',').map(value => value.trim()).filter(Boolean);
+      if (!accepts.some(value => value.toLowerCase().startsWith('application/json'))) accepts.push('application/json');
+      if (!accepts.some(value => value.toLowerCase().startsWith('text/event-stream'))) accepts.push('text/event-stream');
       req.headers.accept = accepts.join(', ');
     }
-
     next();
   });
 
-  const parseMcpJson = express.json({ limit: '12mb', type: () => true });
+  const parseMcpJson = express.json({ limit: '20mb', type: () => true });
   app.all('/mcp', parseMcpJson, (req, res) => {
     const base = requestBaseUrl(req);
     const resource = `${base}/mcp`;
@@ -449,12 +433,10 @@ export async function startMcpGateway({ publicPort, internalPort }) {
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
     const payload = token ? verifyAccessToken(token, LOGIN_SECRET, base, resource) : null;
     const method = String(req.body?.method || req.get('Mcp-Method') || req.method);
-
     res.once('finish', () => {
       const responseContentType = String(res.getHeader('content-type') || '');
       console.log(`[MCP] ${method} -> HTTP ${res.statusCode} ${responseContentType}`);
     });
-
     requestContext.run({ payload, metadataUrl, resource, issuer: base }, () => {
       void mcpNodeHandler(req, res, req.body);
     });
@@ -464,7 +446,7 @@ export async function startMcpGateway({ publicPort, internalPort }) {
     const base = requestBaseUrl(req);
     res.json({
       name: 'Meu WhatsApp MCP',
-      version: '1.5.0',
+      version: '1.6.0',
       mcp: `${base}/mcp`,
       transport: 'streamable-http',
       authentication: 'oauth2-pkce-tool-level',
@@ -473,7 +455,7 @@ export async function startMcpGateway({ publicPort, internalPort }) {
       token: `${base}/oauth/token`,
       callback: STABLE_CHATGPT_REDIRECT,
       scopes: OAUTH_SCOPES,
-      tools: ['whatsapp_status', 'list_whatsapp_chats', 'read_whatsapp_messages', 'search_whatsapp_messages', 'send_whatsapp_message', 'send_whatsapp_image']
+      tools: ['whatsapp_status', 'list_whatsapp_chats', 'read_whatsapp_messages', 'read_whatsapp_audio', 'search_whatsapp_messages', 'send_whatsapp_message', 'send_whatsapp_image']
     });
   });
 
@@ -481,33 +463,22 @@ export async function startMcpGateway({ publicPort, internalPort }) {
     const headers = { ...req.headers, host: `127.0.0.1:${internalPort}` };
     delete headers['content-length'];
     delete headers.connection;
-
-    const upstream = http.request({
-      hostname: '127.0.0.1',
-      port: internalPort,
-      method: req.method,
-      path: req.originalUrl,
-      headers
-    }, upstreamRes => {
+    const upstream = http.request({ hostname: '127.0.0.1', port: internalPort, method: req.method, path: req.originalUrl, headers }, upstreamRes => {
       res.status(upstreamRes.statusCode || 502);
-      for (const [key, value] of Object.entries(upstreamRes.headers)) {
-        if (value !== undefined) res.setHeader(key, value);
-      }
+      for (const [key, value] of Object.entries(upstreamRes.headers)) if (value !== undefined) res.setHeader(key, value);
       upstreamRes.pipe(res);
     });
-
     upstream.on('error', error => {
       console.error('[Gateway] Proxy error:', error);
       if (!res.headersSent) res.status(502).json({ error: 'WhatsApp bridge unavailable' });
       else res.end();
     });
-
     req.pipe(upstream);
   });
 
   const publicServer = app.listen(publicPort, '0.0.0.0', () => {
     console.log(`[Gateway] Public HTTP/MCP listening on 0.0.0.0:${publicPort}`);
-    console.log('[MCP] Endpoint: /mcp (Streamable HTTP + media compatibility + tool-level OAuth)');
+    console.log('[MCP] Endpoint: /mcp (Streamable HTTP + media v2 + tool-level OAuth)');
     console.log(`[OAuth] Client ID: ${CLIENT_ID}`);
     console.log(`[OAuth] Callback: ${STABLE_CHATGPT_REDIRECT}`);
     console.log(`[Gateway] Internal WhatsApp bridge: ${INTERNAL_BASE}`);
@@ -517,9 +488,7 @@ export async function startMcpGateway({ publicPort, internalPort }) {
     try { await mcpHandler.close(); } catch (_) {}
     try { publicServer.close(); } catch (_) {}
   };
-
   process.once('SIGTERM', cleanup);
   process.once('SIGINT', cleanup);
-
   return { app, publicServer, mcpHandler };
 }
