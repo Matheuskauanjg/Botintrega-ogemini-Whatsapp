@@ -21,8 +21,6 @@ const persistentAuthPath = '/var/data/baileys_auth';
 const localAuthPath = path.resolve(process.cwd(), '.baileys_auth');
 const candidates = [];
 
-// Prefer an explicitly configured persistent path. If the current configuration
-// still points to /tmp, try the standard Render persistent disk path first.
 if (configuredAuthPath && !configuredAuthPath.startsWith('/tmp/')) candidates.push(configuredAuthPath);
 candidates.push(persistentAuthPath);
 if (configuredAuthPath) candidates.push(configuredAuthPath);
@@ -56,6 +54,11 @@ await ensureBaileysAuthPath();
 // 1) Bridge REST/Baileys em localhost:10001.
 process.env.PORT = String(internalPort);
 await import('./server-media-v2.js');
+
+// Intercepta somente a leitura interna de /api/audio para acrescentar uma
+// transcrição em texto antes que o resultado chegue ao MCP. O áudio binário
+// continua sendo retornado normalmente como conteúdo MCP.
+await import('./audio-transcription-fetch-patch.js');
 
 // 2) Gateway MCP/OAuth em localhost:10002.
 const { startMcpGateway } = await import('./mcp-gateway-v5.js');
