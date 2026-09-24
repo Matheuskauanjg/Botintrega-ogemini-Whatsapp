@@ -5,6 +5,7 @@ import path from 'node:path';
 
 const publicPort = Number(process.env.PORT || 10000);
 const internalPort = Number(process.env.BRIDGE_INTERNAL_PORT || 10001);
+const mcpGatewayPort = Number(process.env.MCP_GATEWAY_INTERNAL_PORT || 10002);
 
 // Para instalações antigas, QR_SECRET também pode servir como chave da API interna.
 // Em produção prefira configurar API_TOKEN e MCP_LOGIN_SECRET separadamente.
@@ -40,10 +41,15 @@ async function ensureBaileysAuthPath() {
 
 await ensureBaileysAuthPath();
 
-// A bridge REST/Baileys fica somente em localhost; a porta pública é do gateway MCP.
+// 1) Bridge REST/Baileys em localhost:10001.
 process.env.PORT = String(internalPort);
 await import('./server.js');
 
-process.env.PORT = String(publicPort);
+// 2) Gateway MCP/OAuth em localhost:10002.
 const { startMcpGateway } = await import('./mcp-gateway-v5.js');
-await startMcpGateway({ publicPort, internalPort });
+await startMcpGateway({ publicPort: mcpGatewayPort, internalPort });
+
+// 3) Proxy público na PORT do Render. Ele adapta o Content-Type enviado pelo scanner do ChatGPT.
+process.env.PORT = String(publicPort);
+const { startPublicMcpProxy } = await import('./public-mcp-proxy.js');
+startPublicMcpProxy({ publicPort, targetPort: mcpGatewayPort });
