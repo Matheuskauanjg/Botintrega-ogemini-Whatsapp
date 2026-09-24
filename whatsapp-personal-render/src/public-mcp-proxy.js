@@ -17,7 +17,6 @@ function parseMaybeNested(value) {
   const direct = tryJson(trimmed);
   if (direct) return direct;
 
-  // Some gateways encode the JSON payload as base64 inside an octet-stream envelope.
   if (/^[A-Za-z0-9+/=_-]+$/.test(trimmed) && trimmed.length >= 8) {
     try {
       const decoded = Buffer.from(trimmed, 'base64').toString('utf8').trim();
@@ -41,7 +40,6 @@ function decodeMcpBody(buffer, headers) {
   let text = raw.toString('utf8').replace(/^\uFEFF/, '').trim();
   let parsed = tryJson(text);
 
-  // Handle a common binary framing pattern: a 4-byte payload length followed by UTF-8 JSON.
   if (!parsed && raw.length > 4) {
     const remaining = raw.length - 4;
     const be = raw.readUInt32BE(0);
@@ -52,13 +50,8 @@ function decodeMcpBody(buffer, headers) {
     }
   }
 
-  // If the body itself is a JSON string containing JSON, unwrap it.
-  if (typeof parsed === 'string') {
-    parsed = parseMaybeNested(parsed) || parsed;
-  }
+  if (typeof parsed === 'string') parsed = parseMaybeNested(parsed) || parsed;
 
-  // ChatGPT/platform proxies can wrap the JSON-RPC request. Unwrap only when the
-  // nested value clearly looks like MCP/JSON-RPC, so tool arguments are never altered.
   if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && !parsed.method) {
     for (const key of ['request', 'payload', 'body', 'data']) {
       const nested = parseMaybeNested(parsed[key]);
@@ -69,7 +62,6 @@ function decodeMcpBody(buffer, headers) {
     }
   }
 
-  // A single JSON-RPC request wrapped in a one-element array is safe to unwrap.
   if (Array.isArray(parsed) && parsed.length === 1 && parsed[0] && typeof parsed[0] === 'object') {
     parsed = parsed[0];
   }
@@ -92,50 +84,28 @@ function logSafeShape(parsed, byteLength) {
   console.log(`[MCP-PROXY] decoded bytes=${byteLength} kind=${kind} method=${method} jsonrpc=${jsonrpc} keys=[${keys}]`);
 }
 
+function logMcpHeaders(headers) {
+  const protocol = String(headers['mcp-protocol-version'] || '(none)');
+  const method = String(headers['mcp-method'] || '(none)');
+  const name = String(headers['mcp-name'] || '(none)');
+  const session = headers['mcp-session-id'] ? 'present' : 'none';
+  console.log(`[MCP-PROXY] mcp-headers protocol=${protocol} method=${method} name=${name} session=${session}`);
+}
+
 export function startPublicMcpProxy({ publicPort, targetPort }) {
   const server = http.createServer((req, res) => {
     const headers = { ...req.headers };
     const originalContentType = String(headers['content-type'] || '');
     const originalAccept = String(headers.accept || '');
+    const isMcp = req.url?.startsWith('/mcp');
 
-    const forward = bodyBuffer => {
-      if (req.method === 'POST' && req.url?.startsWith('/mcp')) {
-        headers['content-type'] = 'application/json';
-        headers.accept = 'application/json, text/event-stream';
-        delete headers['content-encoding'];
-        headers['content-length'] = String(bodyBuffer.length);
-      }
-
-      headers.host = `127.0.0.1:${targetPort}`;
-      delete headers.connection;
-
-      const upstream = http.request({
-        hostname: '127.0.0.1',
-        port: targetPort,
-        method: req.method,
-        path: req.url,
-        headers
-      }, upstreamRes => {
-        res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
-        upstreamRes.pipe(res);
-      });
-
-      upstream.on('error', error => {
-        console.error('[MCP-PROXY] upstream error:', error);
-        if (!res.headersSent) {
-          res.writeHead(502, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: 'MCP gateway unavailable' }));
-        } else {
-          res.end();
-        }
-      });
-
-      if (bodyBuffer.length) upstream.end(bodyBuffer);
-      else upstream.end();
-    };
-
-    if (req.method === 'POST' && req.url?.startsWith('/mcp')) {
-      console.log(`[MCP-PROXY] POST ${req.url} content-type="${originalContentType || '(none)'}" accept="${originalAccept || '(none)'}" -> decode + application/json`);
+    // ChatGPT's connection validator sends a bodyless POST with octet-stream and
+    // Accept */* before it sends a real MCP request. This is a transport probe,
+    // not JSON-RPC. Treat it as a successful liveness probe instead of handing
+    // an empty body to the MCP SDK (which correctly returns 400 for invalid JSON).
+    if (req.method === 'POST' && isMcp) {
+      console.log(`[MCP-PROXY] POST ${req.url} content-type="${originalContentType || '(none)'}" accept="${originalAccept || '(none)'}"`);
+      logMcpHeaders(headers);
 
       const chunks = [];
       let size = 0;
@@ -151,17 +121,26 @@ export function startPublicMcpProxy({ publicPort, targetPort }) {
         }
 
         const originalBody = Buffer.concat(chunks);
+        if (originalBody.length === 0 && !headers['mcp-method']) {
+          console.log('[MCP-PROXY] empty transport probe -> HTTP 204');
+          res.writeHead(204, {
+            'cache-control': 'no-store',
+            'allow': 'POST, GET, DELETE'
+          });
+          res.end();
+          return;
+        }
+
         const { parsed, decodedBytes } = decodeMcpBody(originalBody, req.headers);
         logSafeShape(parsed, decodedBytes);
 
         if (!parsed || typeof parsed !== 'object') {
-          console.warn('[MCP-PROXY] octet-stream payload could not be decoded as JSON-RPC');
-          res.writeHead(400, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Invalid MCP payload encoding' }));
+          console.warn('[MCP-PROXY] non-empty MCP payload could not be decoded as JSON-RPC; forwarding unchanged for SDK classification');
+          forwardRequest(originalBody, false);
           return;
         }
 
-        forward(Buffer.from(JSON.stringify(parsed), 'utf8'));
+        forwardRequest(Buffer.from(JSON.stringify(parsed), 'utf8'), true);
       });
       req.on('error', error => {
         console.error('[MCP-PROXY] request read error:', error);
@@ -173,29 +152,79 @@ export function startPublicMcpProxy({ publicPort, targetPort }) {
       return;
     }
 
-    // GET/DELETE and non-MCP paths can stream through unchanged.
-    headers.host = `127.0.0.1:${targetPort}`;
-    delete headers.connection;
-    const upstream = http.request({
-      hostname: '127.0.0.1',
-      port: targetPort,
-      method: req.method,
-      path: req.url,
-      headers
-    }, upstreamRes => {
-      res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
-      upstreamRes.pipe(res);
-    });
-    upstream.on('error', error => {
-      console.error('[MCP-PROXY] upstream error:', error);
-      if (!res.headersSent) {
-        res.writeHead(502, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: 'MCP gateway unavailable' }));
-      } else {
-        res.end();
+    // The same validator follows with a bodyless GET using Accept */*. A real
+    // legacy SSE/listen request advertises text/event-stream and is forwarded.
+    if (req.method === 'GET' && isMcp && originalAccept.trim() === '*/*' && !headers['mcp-session-id']) {
+      console.log('[MCP-PROXY] GET transport probe accept="*/*" -> HTTP 204');
+      res.writeHead(204, {
+        'cache-control': 'no-store',
+        'allow': 'POST, GET, DELETE'
+      });
+      res.end();
+      return;
+    }
+
+    streamRequest();
+
+    function forwardRequest(bodyBuffer, normalizedJson) {
+      const forwardHeaders = { ...headers };
+      if (normalizedJson) {
+        forwardHeaders['content-type'] = 'application/json';
+        forwardHeaders.accept = 'application/json, text/event-stream';
+        delete forwardHeaders['content-encoding'];
       }
-    });
-    req.pipe(upstream);
+      forwardHeaders['content-length'] = String(bodyBuffer.length);
+      forwardHeaders.host = `127.0.0.1:${targetPort}`;
+      delete forwardHeaders.connection;
+
+      const upstream = http.request({
+        hostname: '127.0.0.1',
+        port: targetPort,
+        method: req.method,
+        path: req.url,
+        headers: forwardHeaders
+      }, upstreamRes => {
+        res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
+        upstreamRes.pipe(res);
+      });
+
+      upstream.on('error', error => {
+        console.error('[MCP-PROXY] upstream error:', error);
+        if (!res.headersSent) {
+          res.writeHead(502, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'MCP gateway unavailable' }));
+        } else {
+          res.end();
+        }
+      });
+
+      upstream.end(bodyBuffer);
+    }
+
+    function streamRequest() {
+      const forwardHeaders = { ...headers, host: `127.0.0.1:${targetPort}` };
+      delete forwardHeaders.connection;
+      const upstream = http.request({
+        hostname: '127.0.0.1',
+        port: targetPort,
+        method: req.method,
+        path: req.url,
+        headers: forwardHeaders
+      }, upstreamRes => {
+        res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
+        upstreamRes.pipe(res);
+      });
+      upstream.on('error', error => {
+        console.error('[MCP-PROXY] upstream error:', error);
+        if (!res.headersSent) {
+          res.writeHead(502, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'MCP gateway unavailable' }));
+        } else {
+          res.end();
+        }
+      });
+      req.pipe(upstream);
+    }
   });
 
   server.listen(publicPort, '0.0.0.0', () => {
