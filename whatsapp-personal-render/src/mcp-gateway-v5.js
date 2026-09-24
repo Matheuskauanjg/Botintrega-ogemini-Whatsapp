@@ -156,7 +156,7 @@ export async function startMcpGateway({ publicPort, internalPort }) {
   }
 
   function createWhatsappMcpServer() {
-    const server = new McpServer({ name: 'meu-whatsapp', version: '1.4.0' });
+    const server = new McpServer({ name: 'meu-whatsapp', version: '1.5.0' });
 
     server.registerTool('whatsapp_status', {
       title: 'Status do WhatsApp',
@@ -229,6 +229,32 @@ export async function startMcpGateway({ publicPort, internalPort }) {
         return textResult(await internalJson('/api/send', {
           method: 'POST',
           body: JSON.stringify({ to, message })
+        }));
+      } catch (error) {
+        return errorResult(error.message);
+      }
+    });
+
+    server.registerTool('send_whatsapp_image', {
+      title: 'Enviar imagem no WhatsApp',
+      description: 'Envia uma imagem para um contato ou grupo do WhatsApp. Use imageUrl para uma URL pública ou imageBase64/data URL para conteúdo em base64. Pode incluir legenda.',
+      inputSchema: z.object({
+        to: z.string().min(1).describe('Número com DDI ou JID do WhatsApp, incluindo grupos @g.us.'),
+        imageUrl: z.string().url().optional().describe('URL pública http/https da imagem.'),
+        imageBase64: z.string().optional().describe('Imagem em base64 puro ou data:image/...;base64,...'),
+        mimetype: z.string().optional().describe('MIME type quando imageBase64 não for data URL, por exemplo image/png.'),
+        caption: z.string().max(5000).optional().describe('Legenda opcional da imagem.')
+      }),
+      ...authDescriptor(['whatsapp.send']),
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true }
+    }, async ({ to, imageUrl, imageBase64, mimetype, caption }) => {
+      const denied = requireToolAuth(['whatsapp.send']);
+      if (denied) return denied;
+      if (!imageUrl && !imageBase64) return errorResult('imageUrl or imageBase64 is required');
+      try {
+        return textResult(await internalJson('/api/send-image', {
+          method: 'POST',
+          body: JSON.stringify({ to, imageUrl, imageBase64, mimetype, caption })
         }));
       } catch (error) {
         return errorResult(error.message);
@@ -389,8 +415,6 @@ export async function startMcpGateway({ publicPort, internalPort }) {
     });
   });
 
-  // Compatibility shim for ChatGPT's MCP scanner and strict MCP SDK v2 media-type validation.
-  // The SDK requires application/json for POST and clients should advertise both JSON and SSE.
   app.use('/mcp', (req, _res, next) => {
     const originalContentType = String(req.headers['content-type'] || '');
     const originalAccept = String(req.headers.accept || '');
@@ -416,7 +440,7 @@ export async function startMcpGateway({ publicPort, internalPort }) {
     next();
   });
 
-  const parseMcpJson = express.json({ limit: '4mb', type: () => true });
+  const parseMcpJson = express.json({ limit: '12mb', type: () => true });
   app.all('/mcp', parseMcpJson, (req, res) => {
     const base = requestBaseUrl(req);
     const resource = `${base}/mcp`;
@@ -440,7 +464,7 @@ export async function startMcpGateway({ publicPort, internalPort }) {
     const base = requestBaseUrl(req);
     res.json({
       name: 'Meu WhatsApp MCP',
-      version: '1.4.0',
+      version: '1.5.0',
       mcp: `${base}/mcp`,
       transport: 'streamable-http',
       authentication: 'oauth2-pkce-tool-level',
@@ -449,7 +473,7 @@ export async function startMcpGateway({ publicPort, internalPort }) {
       token: `${base}/oauth/token`,
       callback: STABLE_CHATGPT_REDIRECT,
       scopes: OAUTH_SCOPES,
-      tools: ['whatsapp_status', 'list_whatsapp_chats', 'read_whatsapp_messages', 'search_whatsapp_messages', 'send_whatsapp_message']
+      tools: ['whatsapp_status', 'list_whatsapp_chats', 'read_whatsapp_messages', 'search_whatsapp_messages', 'send_whatsapp_message', 'send_whatsapp_image']
     });
   });
 
