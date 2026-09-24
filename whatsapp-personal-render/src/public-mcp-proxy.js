@@ -2,6 +2,7 @@ import http from 'node:http';
 import zlib from 'node:zlib';
 
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
+const INTERNAL_CLIENT_ID = 'chatgpt-meu-whatsapp';
 
 function tryJson(text) {
   try { return JSON.parse(text); } catch { return null; }
@@ -92,12 +93,116 @@ function logMcpHeaders(headers) {
   console.log(`[MCP-PROXY] mcp-headers protocol=${protocol} method=${method} name=${name} session=${session}`);
 }
 
+function publicBaseUrl(req) {
+  const configured = String(process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
+  if (configured) return configured;
+  const proto = String(req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
+  return `${proto}://${req.headers.host}`;
+}
+
+function isChatGptCimdClientId(value) {
+  try {
+    const parsed = new URL(String(value || ''));
+    if (parsed.protocol !== 'https:' || parsed.hostname !== 'chatgpt.com') return false;
+    if (parsed.pathname === '/oauth/client.json') return true;
+    return /^\/oauth\/[^/]+\/client\.json$/.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function rewriteClientIdValue(value) {
+  if (isChatGptCimdClientId(value)) {
+    console.log('[OAuth-PROXY] ChatGPT CIMD client_id -> internal predefined client');
+    return INTERNAL_CLIENT_ID;
+  }
+  return value;
+}
+
+function rewriteClientIdInPath(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl, 'https://mcp.local');
+    if (parsed.pathname !== '/oauth/authorize') return rawUrl;
+    const current = parsed.searchParams.get('client_id');
+    if (!current) return rawUrl;
+    const rewritten = rewriteClientIdValue(current);
+    if (rewritten === current) return rawUrl;
+    parsed.searchParams.set('client_id', rewritten);
+    return `${parsed.pathname}${parsed.search}`;
+  } catch {
+    return rawUrl;
+  }
+}
+
+function rewriteFormClientId(buffer) {
+  const text = buffer.toString('utf8');
+  const params = new URLSearchParams(text);
+  const current = params.get('client_id');
+  if (!current) return buffer;
+  const rewritten = rewriteClientIdValue(current);
+  if (rewritten === current) return buffer;
+  params.set('client_id', rewritten);
+  return Buffer.from(params.toString(), 'utf8');
+}
+
 export function startPublicMcpProxy({ publicPort, targetPort }) {
   const server = http.createServer((req, res) => {
     const headers = { ...req.headers };
     const originalContentType = String(headers['content-type'] || '');
     const originalAccept = String(headers.accept || '');
     const isMcp = req.url?.startsWith('/mcp');
+
+    // Advertise CIMD support at the public origin. The internal gateway remains a
+    // simple predefined public client; this proxy translates ChatGPT's CIMD client_id.
+    if (req.method === 'GET' && req.url?.split('?')[0] === '/.well-known/oauth-authorization-server') {
+      const base = publicBaseUrl(req);
+      res.writeHead(200, {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store'
+      });
+      res.end(JSON.stringify({
+        issuer: base,
+        authorization_endpoint: `${base}/oauth/authorize`,
+        token_endpoint: `${base}/oauth/token`,
+        response_types_supported: ['code'],
+        grant_types_supported: ['authorization_code'],
+        code_challenge_methods_supported: ['S256'],
+        token_endpoint_auth_methods_supported: ['none'],
+        authorization_response_iss_parameter_supported: true,
+        client_id_metadata_document_supported: true,
+        scopes_supported: ['whatsapp.read', 'whatsapp.send']
+      }));
+      console.log('[OAuth-PROXY] authorization metadata -> CIMD enabled');
+      return;
+    }
+
+    // Rewrite ChatGPT's CIMD client_id on the authorization request to the
+    // predefined public client understood by the internal OAuth gateway.
+    if (req.method === 'GET' && req.url?.startsWith('/oauth/authorize')) {
+      streamRequest(rewriteClientIdInPath(req.url));
+      return;
+    }
+
+    // Token and authorization POSTs are form encoded. Buffer them only to rewrite
+    // client_id; secrets/passwords are never logged.
+    if (req.method === 'POST' && (req.url?.startsWith('/oauth/token') || req.url?.startsWith('/oauth/authorize'))) {
+      const chunks = [];
+      let size = 0;
+      req.on('data', chunk => {
+        size += chunk.length;
+        if (size <= MAX_BODY_BYTES) chunks.push(chunk);
+      });
+      req.on('end', () => {
+        if (size > MAX_BODY_BYTES) {
+          res.writeHead(413, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'OAuth request body too large' }));
+          return;
+        }
+        const rewritten = rewriteFormClientId(Buffer.concat(chunks));
+        forwardRequest(rewritten, false, req.url);
+      });
+      return;
+    }
 
     // ChatGPT's connection validator sends a bodyless POST with octet-stream and
     // Accept */* before it sends a real MCP request. This is a transport probe,
@@ -166,7 +271,7 @@ export function startPublicMcpProxy({ publicPort, targetPort }) {
 
     streamRequest();
 
-    function forwardRequest(bodyBuffer, normalizedJson) {
+    function forwardRequest(bodyBuffer, normalizedJson, pathOverride = req.url) {
       const forwardHeaders = { ...headers };
       if (normalizedJson) {
         forwardHeaders['content-type'] = 'application/json';
@@ -181,7 +286,7 @@ export function startPublicMcpProxy({ publicPort, targetPort }) {
         hostname: '127.0.0.1',
         port: targetPort,
         method: req.method,
-        path: req.url,
+        path: pathOverride,
         headers: forwardHeaders
       }, upstreamRes => {
         res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
@@ -201,14 +306,14 @@ export function startPublicMcpProxy({ publicPort, targetPort }) {
       upstream.end(bodyBuffer);
     }
 
-    function streamRequest() {
+    function streamRequest(pathOverride = req.url) {
       const forwardHeaders = { ...headers, host: `127.0.0.1:${targetPort}` };
       delete forwardHeaders.connection;
       const upstream = http.request({
         hostname: '127.0.0.1',
         port: targetPort,
         method: req.method,
-        path: req.url,
+        path: pathOverride,
         headers: forwardHeaders
       }, upstreamRes => {
         res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
