@@ -12,25 +12,17 @@ const API_TOKEN = process.env.API_TOKEN || '';
 const QR_SECRET = process.env.QR_SECRET || '';
 const AUTH_PATH = process.env.WWEBJS_AUTH_PATH || '/tmp/.wwebjs_auth';
 
-let latestQr = null;
 let latestQrDataUrl = null;
 let whatsappState = 'starting';
 let lastError = null;
 let me = null;
 
 function requireApiToken(req, res, next) {
-  if (!API_TOKEN) {
-    return res.status(503).json({ error: 'API_TOKEN is not configured' });
-  }
-
+  if (!API_TOKEN) return res.status(503).json({ error: 'API_TOKEN is not configured' });
   const auth = req.headers.authorization || '';
   const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : null;
   const apiKey = req.headers['x-api-key'];
-
-  if (bearer !== API_TOKEN && apiKey !== API_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
+  if (bearer !== API_TOKEN && apiKey !== API_TOKEN) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
 
@@ -73,80 +65,57 @@ const client = new Client({
   puppeteer: {
     headless: true,
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--no-first-run',
-      '--no-zygote'
-    ]
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-first-run', '--no-zygote']
   }
 });
 
 client.on('qr', async (qr) => {
   try {
-    latestQr = qr;
-    latestQrDataUrl = await QRCode.toDataURL(qr, { width: 420, margin: 2 });
+    latestQrDataUrl = await QRCode.toDataURL(qr, {
+      width: 520,
+      margin: 3,
+      errorCorrectionLevel: 'M'
+    });
     whatsappState = 'waiting_for_qr_scan';
     lastError = null;
-    console.log('[WhatsApp] QR generated. Open /qr to scan.');
+    console.log('[WhatsApp] QR gráfico pronto em /qr');
   } catch (error) {
     lastError = error.message;
-    console.error('[WhatsApp] Failed to render QR:', error);
+    console.error('[WhatsApp] Erro ao gerar QR:', error);
   }
 });
 
 client.on('authenticated', () => {
   whatsappState = 'authenticated';
-  latestQr = null;
   latestQrDataUrl = null;
-  console.log('[WhatsApp] Authenticated.');
+  console.log('[WhatsApp] Autenticado.');
 });
 
-client.on('ready', async () => {
+client.on('ready', () => {
   whatsappState = 'ready';
-  latestQr = null;
   latestQrDataUrl = null;
   lastError = null;
-  try {
-    me = client.info ? {
-      wid: client.info.wid?._serialized,
-      pushname: client.info.pushname || null,
-      platform: client.info.platform || null
-    } : null;
-  } catch (_) {
-    me = null;
-  }
-  console.log('[WhatsApp] Client ready.');
+  me = client.info ? {
+    wid: client.info.wid?._serialized,
+    pushname: client.info.pushname || null,
+    platform: client.info.platform || null
+  } : null;
+  console.log('[WhatsApp] Cliente pronto.');
 });
 
 client.on('auth_failure', (message) => {
   whatsappState = 'auth_failure';
-  lastError = String(message || 'Authentication failed');
-  console.error('[WhatsApp] Authentication failure:', message);
+  lastError = String(message || 'Falha na autenticação');
 });
 
 client.on('disconnected', (reason) => {
   whatsappState = 'disconnected';
-  lastError = String(reason || 'Disconnected');
+  lastError = String(reason || 'Desconectado');
   me = null;
-  console.error('[WhatsApp] Disconnected:', reason);
-});
-
-client.on('change_state', (state) => {
-  console.log('[WhatsApp] State:', state);
 });
 
 app.get('/', (_req, res) => {
-  res.type('html').send(`<!doctype html>
-<html lang="pt-BR">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WhatsApp Personal Bridge</title></head>
-<body style="font-family:Arial,sans-serif;max-width:760px;margin:40px auto;padding:0 20px">
-  <h1>WhatsApp Personal Bridge</h1>
-  <p>Serviço ativo. Use <code>/health</code> para saúde e <code>/qr?key=SUA_CHAVE</code> para autenticar o WhatsApp.</p>
-  <p>Status atual: <strong>${whatsappState}</strong></p>
-</body></html>`);
+  res.type('html').send(`<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WhatsApp Personal Bridge</title></head><body style="font-family:Arial,sans-serif;max-width:760px;margin:40px auto;padding:0 20px"><h1>WhatsApp Personal Bridge</h1><p>Serviço ativo.</p><p><a href="/qr">Abrir QR Code</a></p><p>Status: <strong>${whatsappState}</strong></p></body></html>`);
 });
 
 app.get('/health', (_req, res) => {
@@ -155,73 +124,51 @@ app.get('/health', (_req, res) => {
     service: 'whatsapp-personal-render',
     whatsappState,
     ready: whatsappState === 'ready',
+    hasQr: Boolean(latestQrDataUrl),
     lastError
   });
 });
 
 app.get('/qr', (req, res) => {
-  if (!QR_SECRET || req.query.key !== QR_SECRET) {
-    return res.status(401).type('html').send('<h1>401 - chave do QR inválida</h1>');
+  // Se QR_SECRET estiver configurado, exige ?key=. Se não estiver, /qr abre normalmente.
+  if (QR_SECRET && req.query.key !== QR_SECRET) {
+    return res.status(401).type('html').send('<h1>401 - chave do QR inválida</h1><p>Use /qr?key=SUA_CHAVE.</p>');
   }
 
-  const qrBlock = latestQrDataUrl
-    ? `<img src="${latestQrDataUrl}" alt="QR Code do WhatsApp" style="width:min(420px,90vw);height:auto;border:1px solid #ddd;border-radius:16px;padding:12px;background:#fff">`
-    : whatsappState === 'ready'
-      ? '<div style="font-size:64px">✅</div><h2>WhatsApp conectado</h2>'
-      : '<div class="spinner"></div><h2>Aguardando um QR Code...</h2>';
+  let content;
+  if (latestQrDataUrl) {
+    content = `<div class="badge">Aguardando leitura</div><img src="${latestQrDataUrl}" alt="QR Code do WhatsApp" class="qr"><p>Abra o WhatsApp → Dispositivos conectados → Conectar dispositivo.</p>`;
+  } else if (whatsappState === 'ready' || whatsappState === 'authenticated') {
+    content = '<div class="ok">✓</div><h2>WhatsApp conectado</h2><p>A sessão foi autenticada com sucesso.</p>';
+  } else {
+    content = '<div class="spinner"></div><h2>Gerando QR Code...</h2><p>A página atualiza automaticamente.</p>';
+  }
 
   res.type('html').send(`<!doctype html>
-<html lang="pt-BR">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta http-equiv="refresh" content="5">
-  <title>Conectar WhatsApp</title>
-  <style>
-    body{margin:0;background:#f5f7f8;font-family:Arial,sans-serif;color:#172b24;display:grid;place-items:center;min-height:100vh}
-    main{background:white;border-radius:24px;padding:32px;text-align:center;box-shadow:0 10px 35px rgba(0,0,0,.08);width:min(520px,calc(100vw - 48px))}
-    code{background:#eef3f1;padding:4px 8px;border-radius:6px}.state{margin-top:18px;color:#587068}
-    .spinner{width:42px;height:42px;border:5px solid #ddd;border-top-color:#222;border-radius:50%;margin:24px auto;animation:s 1s linear infinite}@keyframes s{to{transform:rotate(360deg)}}
-  </style>
-</head>
-<body><main>
-  <h1>Conectar WhatsApp</h1>
-  <p>No celular: WhatsApp → Dispositivos conectados → Conectar dispositivo.</p>
-  ${qrBlock}
-  <p class="state">Estado: <code>${whatsappState}</code></p>
-  <small>A página atualiza automaticamente a cada 5 segundos.</small>
-</main></body></html>`);
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="4"><title>Conectar WhatsApp</title>
+<style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#eef3f1;font-family:Arial,sans-serif;color:#172b24;padding:24px}.card{width:min(600px,100%);background:#fff;border-radius:24px;padding:32px;text-align:center;box-shadow:0 12px 40px rgba(0,0,0,.1)}.qr{display:block;width:min(520px,100%);height:auto;margin:22px auto;background:#fff;border:1px solid #dce5e1;border-radius:16px;padding:10px}.badge{display:inline-block;padding:8px 14px;background:#fff3cd;color:#725700;border-radius:999px;font-weight:700}.ok{width:84px;height:84px;border-radius:50%;display:grid;place-items:center;margin:20px auto;background:#dff7e8;color:#13763d;font-size:48px;font-weight:bold}.spinner{width:50px;height:50px;border:6px solid #d8e1dd;border-top-color:#25d366;border-radius:50%;margin:24px auto;animation:s 1s linear infinite}@keyframes s{to{transform:rotate(360deg)}}.state{margin-top:18px;color:#657970;font-size:14px}</style></head>
+<body><main class="card"><h1>Conectar WhatsApp</h1>${content}<div class="state">Estado: <strong>${whatsappState}</strong>${lastError ? `<br>Erro: ${String(lastError).replace(/</g, '&lt;')}` : ''}</div></main></body></html>`);
 });
 
 app.get('/openapi.json', (req, res) => {
   const serverUrl = process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`;
   res.json({
     openapi: '3.1.0',
-    info: {
-      title: 'Personal WhatsApp Bridge API',
-      version: '1.0.0',
-      description: 'Private API for reading and sending messages through a personal WhatsApp Web session.'
-    },
+    info: { title: 'Personal WhatsApp Bridge API', version: '1.0.1' },
     servers: [{ url: serverUrl }],
-    components: {
-      securitySchemes: {
-        bearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'API token' }
-      }
-    },
+    components: { securitySchemes: { bearerAuth: { type: 'http', scheme: 'bearer' } } },
     security: [{ bearerAuth: [] }],
     paths: {
-      '/api/status': { get: { operationId: 'getWhatsAppStatus', summary: 'Get WhatsApp connection status', responses: { '200': { description: 'Status' } } } },
-      '/api/chats': { get: { operationId: 'listChats', summary: 'List recent WhatsApp chats', parameters: [{ name: 'limit', in: 'query', schema: { type: 'integer', default: 30, maximum: 100 } }], responses: { '200': { description: 'Chats' } } } },
-      '/api/chats/{chatId}/messages': { get: { operationId: 'getChatMessages', summary: 'Read messages from a chat', parameters: [{ name: 'chatId', in: 'path', required: true, schema: { type: 'string' } }, { name: 'limit', in: 'query', schema: { type: 'integer', default: 30, maximum: 100 } }], responses: { '200': { description: 'Messages' } } } },
-      '/api/search': { get: { operationId: 'searchMessages', summary: 'Search recent WhatsApp messages', parameters: [{ name: 'q', in: 'query', required: true, schema: { type: 'string' } }, { name: 'chatLimit', in: 'query', schema: { type: 'integer', default: 30, maximum: 100 } }, { name: 'messagesPerChat', in: 'query', schema: { type: 'integer', default: 50, maximum: 100 } }], responses: { '200': { description: 'Search results' } } } },
-      '/api/send': { post: { operationId: 'sendWhatsAppMessage', summary: 'Send a WhatsApp message to one phone number', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['to', 'message'], properties: { to: { type: 'string', description: 'Phone number with country code, digits only or formatted.' }, message: { type: 'string', maxLength: 5000 } } } } } }, responses: { '200': { description: 'Message sent' } } } }
+      '/api/status': { get: { operationId: 'getWhatsAppStatus', summary: 'Get WhatsApp status', responses: { '200': { description: 'Status' } } } },
+      '/api/chats': { get: { operationId: 'listChats', summary: 'List chats', parameters: [{ name: 'limit', in: 'query', schema: { type: 'integer', default: 30, maximum: 100 } }], responses: { '200': { description: 'Chats' } } } },
+      '/api/chats/{chatId}/messages': { get: { operationId: 'getChatMessages', summary: 'Get chat messages', parameters: [{ name: 'chatId', in: 'path', required: true, schema: { type: 'string' } }, { name: 'limit', in: 'query', schema: { type: 'integer', default: 30, maximum: 100 } }], responses: { '200': { description: 'Messages' } } } },
+      '/api/search': { get: { operationId: 'searchMessages', summary: 'Search messages', parameters: [{ name: 'q', in: 'query', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'Results' } } } },
+      '/api/send': { post: { operationId: 'sendWhatsAppMessage', summary: 'Send one WhatsApp message', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['to', 'message'], properties: { to: { type: 'string' }, message: { type: 'string', maxLength: 5000 } } } } } }, responses: { '200': { description: 'Sent' } } } }
     }
   });
 });
 
-app.get('/api/status', requireApiToken, (_req, res) => {
-  res.json({ state: whatsappState, ready: whatsappState === 'ready', me, lastError });
-});
+app.get('/api/status', requireApiToken, (_req, res) => res.json({ state: whatsappState, ready: whatsappState === 'ready', me, lastError }));
 
 app.get('/api/chats', requireApiToken, async (req, res) => {
   try {
@@ -229,9 +176,7 @@ app.get('/api/chats', requireApiToken, async (req, res) => {
     const limit = Math.min(Math.max(Number(req.query.limit || 30), 1), 100);
     const chats = await client.getChats();
     res.json({ chats: chats.slice(0, limit).map(serializeChat) });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.get('/api/chats/:chatId/messages', requireApiToken, async (req, res) => {
@@ -241,9 +186,7 @@ app.get('/api/chats/:chatId/messages', requireApiToken, async (req, res) => {
     const chat = await client.getChatById(req.params.chatId);
     const messages = await chat.fetchMessages({ limit });
     res.json({ chat: serializeChat(chat), messages: messages.map(serializeMessage) });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.get('/api/search', requireApiToken, async (req, res) => {
@@ -251,26 +194,17 @@ app.get('/api/search', requireApiToken, async (req, res) => {
     if (whatsappState !== 'ready') return res.status(409).json({ error: 'WhatsApp is not ready', state: whatsappState });
     const q = String(req.query.q || '').trim().toLowerCase();
     if (!q) return res.status(400).json({ error: 'Query parameter q is required' });
-
-    const chatLimit = Math.min(Math.max(Number(req.query.chatLimit || 30), 1), 100);
-    const messagesPerChat = Math.min(Math.max(Number(req.query.messagesPerChat || 50), 1), 100);
-    const chats = (await client.getChats()).slice(0, chatLimit);
+    const chats = (await client.getChats()).slice(0, 30);
     const results = [];
-
     for (const chat of chats) {
-      const messages = await chat.fetchMessages({ limit: messagesPerChat });
+      const messages = await chat.fetchMessages({ limit: 50 });
       for (const message of messages) {
-        if ((message.body || '').toLowerCase().includes(q)) {
-          results.push({ chat: serializeChat(chat), message: serializeMessage(message) });
-        }
+        if ((message.body || '').toLowerCase().includes(q)) results.push({ chat: serializeChat(chat), message: serializeMessage(message) });
       }
     }
-
     results.sort((a, b) => (b.message.timestamp || 0) - (a.message.timestamp || 0));
     res.json({ query: q, results: results.slice(0, 100) });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.post('/api/send', requireApiToken, async (req, res) => {
@@ -278,20 +212,14 @@ app.post('/api/send', requireApiToken, async (req, res) => {
     if (whatsappState !== 'ready') return res.status(409).json({ error: 'WhatsApp is not ready', state: whatsappState });
     const number = normalizeNumber(req.body?.to);
     const message = String(req.body?.message || '').trim();
-
     if (!number || number.length < 10) return res.status(400).json({ error: 'Invalid phone number' });
     if (!message) return res.status(400).json({ error: 'Message is required' });
     if (message.length > 5000) return res.status(400).json({ error: 'Message is too long' });
-
     const chatId = `${number}@c.us`;
-    const registered = await client.isRegisteredUser(chatId);
-    if (!registered) return res.status(404).json({ error: 'Number is not registered on WhatsApp' });
-
+    if (!(await client.isRegisteredUser(chatId))) return res.status(404).json({ error: 'Number is not registered on WhatsApp' });
     const sent = await client.sendMessage(chatId, message);
     res.json({ ok: true, id: sent.id?._serialized, to: number, timestamp: sent.timestamp });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.listen(PORT, '0.0.0.0', () => {
@@ -308,6 +236,5 @@ async function shutdown(signal) {
   try { await client.destroy(); } catch (_) {}
   process.exit(0);
 }
-
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
