@@ -45,5 +45,5 @@ process.env.PORT = String(internalPort);
 await import('./server.js');
 
 process.env.PORT = String(publicPort);
-const { startMcpGateway } = await import('./mcp-gateway.js');
+const { startMcpGateway } = await import('./mcp-gateway-v2.js');
 await startMcpGateway({ publicPort, internalPort });
