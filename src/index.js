@@ -1,7 +1,6 @@
-// Launcher da bridge pessoal do WhatsApp para o Render.
-// O serviço está configurado com Start Command fixo: `node src/index.js`.
-// A bridge Baileys é ESM, então carregamos via import dinâmico.
-import('../whatsapp-personal-render/src/server.js').catch(error => {
-  console.error('[Launcher] Falha ao iniciar bridge Baileys:', error);
+// Launcher da bridge pessoal do WhatsApp + MCP para o Render.
+// Mantido porque o serviço está configurado com Start Command fixo: `node src/index.js`.
+import('../whatsapp-personal-render/src/gateway-entry.js').catch(error => {
+  console.error('[Launcher] Falha ao iniciar bridge Baileys/MCP:', error);
   process.exit(1);
 });
