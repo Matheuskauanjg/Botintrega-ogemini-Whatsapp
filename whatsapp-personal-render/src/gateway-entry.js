@@ -4,8 +4,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 const publicPort = Number(process.env.PORT || 10000);
-const internalPort = Number(process.env.BRIDGE_INTERNAL_PORT || 10001);
+const bridgePort = Number(process.env.BRIDGE_INTERNAL_PORT || 10001);
 const mcpGatewayPort = Number(process.env.MCP_GATEWAY_INTERNAL_PORT || 10002);
+const audioHandoffPort = Number(process.env.AUDIO_HANDOFF_INTERNAL_PORT || 10003);
 
 if (!process.env.API_TOKEN && process.env.QR_SECRET) {
   process.env.API_TOKEN = process.env.QR_SECRET;
@@ -52,19 +53,20 @@ async function ensureBaileysAuthPath() {
 await ensureBaileysAuthPath();
 
 // 1) Bridge REST/Baileys em localhost:10001.
-process.env.PORT = String(internalPort);
+process.env.PORT = String(bridgePort);
 await import('./server-media-v2.js');
 
-// Intercepta somente a leitura interna de /api/audio para acrescentar uma
-// transcrição em texto antes que o resultado chegue ao MCP. O áudio binário
-// continua sendo retornado normalmente como conteúdo MCP.
-await import('./audio-transcription-fetch-patch.js');
+// 2) Proxy interno de handoff de áudio. Ele acrescenta uma URL temporária
+// assinada ao resultado de /api/audio e serve a mídia por poucos minutos.
+const { startAudioHandoffProxy } = await import('./audio-handoff-proxy.js');
+startAudioHandoffProxy({ listenPort: audioHandoffPort, bridgePort });
 
-// 2) Gateway MCP/OAuth em localhost:10002.
+// 3) Gateway MCP/OAuth usa o handoff proxy como API interna. Todas as rotas
+// que não são de áudio apenas atravessam para o bridge original.
 const { startMcpGateway } = await import('./mcp-gateway-v5.js');
-await startMcpGateway({ publicPort: mcpGatewayPort, internalPort });
+await startMcpGateway({ publicPort: mcpGatewayPort, internalPort: audioHandoffPort });
 
-// 3) Proxy público na PORT do Render.
+// 4) Proxy público na PORT do Render.
 process.env.PORT = String(publicPort);
 const { startPublicMcpProxy } = await import('./public-mcp-proxy.js');
 startPublicMcpProxy({ publicPort, targetPort: mcpGatewayPort });
