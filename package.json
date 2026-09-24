@@ -1,6 +1,6 @@
 {
   "name": "whatsapp-personal-render-launcher",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Launcher da bridge pessoal WhatsApp para Render",
   "scripts": {
@@ -8,6 +8,6 @@
     "start": "npm --prefix whatsapp-personal-render start"
   },
   "engines": {
-    "node": ">=20"
+    "node": "22.x"
   }
 }
