@@ -12,7 +12,7 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '12mb' }));
 
 const PORT = Number(process.env.PORT || 10000);
 const API_TOKEN = process.env.API_TOKEN || '';
@@ -42,6 +42,7 @@ const chats = new Map();
 const contacts = new Map();
 const messagesByChat = new Map();
 const MAX_MESSAGES_PER_CHAT = 250;
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 
 function requireApiToken(req, res, next) {
   if (!API_TOKEN) return res.status(503).json({ error: 'API_TOKEN is not configured' });
@@ -182,6 +183,70 @@ function jidFromDestination(value) {
   const digits = raw.replace(/\D/g, '');
   if (digits.length < 10) return null;
   return `${digits}@s.whatsapp.net`;
+}
+
+function isPrivateImageHostname(hostname) {
+  const host = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host) return true;
+  if (host === 'localhost' || host === '::1' || host.endsWith('.local')) return true;
+  if (/^127\./.test(host) || /^10\./.test(host) || /^169\.254\./.test(host) || /^192\.168\./.test(host)) return true;
+  const match172 = host.match(/^172\.(\d+)\./);
+  if (match172 && Number(match172[1]) >= 16 && Number(match172[1]) <= 31) return true;
+  return false;
+}
+
+async function resolveImageInput(body) {
+  const imageUrl = String(body?.imageUrl || '').trim();
+  const imageBase64 = String(body?.imageBase64 || '').trim();
+  const requestedMime = String(body?.mimetype || '').trim();
+
+  if (imageBase64) {
+    let encoded = imageBase64;
+    let mimetype = requestedMime || 'image/jpeg';
+    const dataUri = imageBase64.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/s);
+    if (dataUri) {
+      mimetype = dataUri[1];
+      encoded = dataUri[2];
+    }
+
+    const buffer = Buffer.from(encoded, 'base64');
+    if (!buffer.length) throw new Error('imageBase64 is empty or invalid');
+    if (buffer.length > MAX_IMAGE_BYTES) throw new Error('Image exceeds 8 MB limit');
+    return { buffer, mimetype, source: 'base64' };
+  }
+
+  if (!imageUrl) throw new Error('imageUrl or imageBase64 is required');
+
+  let url;
+  try { url = new URL(imageUrl); } catch { throw new Error('Invalid image URL'); }
+  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Image URL must use http or https');
+  if (isPrivateImageHostname(url.hostname)) throw new Error('Private or local image URLs are not allowed');
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  let response;
+  try {
+    response = await fetch(url, { redirect: 'follow', signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (!response.ok) throw new Error(`Could not download image: HTTP ${response.status}`);
+  const contentType = String(response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  if (contentType && !contentType.startsWith('image/')) throw new Error(`URL is not an image (${contentType})`);
+
+  const declaredLength = Number(response.headers.get('content-length') || 0);
+  if (declaredLength > MAX_IMAGE_BYTES) throw new Error('Image exceeds 8 MB limit');
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (!buffer.length) throw new Error('Downloaded image is empty');
+  if (buffer.length > MAX_IMAGE_BYTES) throw new Error('Image exceeds 8 MB limit');
+
+  return {
+    buffer,
+    mimetype: requestedMime || contentType || 'image/jpeg',
+    source: 'url'
+  };
 }
 
 function isReady() {
@@ -391,7 +456,7 @@ app.get('/openapi.json', (req, res) => {
     openapi: '3.1.0',
     info: {
       title: 'Personal WhatsApp Bridge API',
-      version: '2.0.0',
+      version: '2.1.0',
       description: 'Private WhatsApp API powered by Baileys (WebSocket, no browser).'
     },
     servers: [{ url: serverUrl }],
@@ -406,7 +471,8 @@ app.get('/openapi.json', (req, res) => {
       '/api/chats': { get: { operationId: 'listChats', summary: 'List cached WhatsApp chats', parameters: [{ name: 'limit', in: 'query', schema: { type: 'integer', default: 30, maximum: 100 } }], responses: { '200': { description: 'Chats' } } } },
       '/api/chats/{chatId}/messages': { get: { operationId: 'getChatMessages', summary: 'Read cached messages from a chat', parameters: [{ name: 'chatId', in: 'path', required: true, schema: { type: 'string' } }, { name: 'limit', in: 'query', schema: { type: 'integer', default: 30, maximum: 100 } }], responses: { '200': { description: 'Messages' } } } },
       '/api/search': { get: { operationId: 'searchMessages', summary: 'Search cached WhatsApp messages', parameters: [{ name: 'q', in: 'query', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'Search results' } } } },
-      '/api/send': { post: { operationId: 'sendWhatsAppMessage', summary: 'Send one WhatsApp text message', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['to', 'message'], properties: { to: { type: 'string', description: 'Phone number with country code or a WhatsApp JID.' }, message: { type: 'string', maxLength: 5000 } } } } } }, responses: { '200': { description: 'Message sent' } } } }
+      '/api/send': { post: { operationId: 'sendWhatsAppMessage', summary: 'Send one WhatsApp text message', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['to', 'message'], properties: { to: { type: 'string', description: 'Phone number with country code or a WhatsApp JID.' }, message: { type: 'string', maxLength: 5000 } } } } } }, responses: { '200': { description: 'Message sent' } } } },
+      '/api/send-image': { post: { operationId: 'sendWhatsAppImage', summary: 'Send one WhatsApp image from a public URL or base64 payload', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['to'], properties: { to: { type: 'string' }, imageUrl: { type: 'string', format: 'uri' }, imageBase64: { type: 'string' }, mimetype: { type: 'string' }, caption: { type: 'string', maxLength: 5000 } } } } } }, responses: { '200': { description: 'Image sent' } } } }
     }
   });
 });
@@ -482,6 +548,40 @@ app.post('/api/send', requireApiToken, async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/send-image', requireApiToken, async (req, res) => {
+  try {
+    if (!isReady()) {
+      return res.status(409).json({ error: 'WhatsApp is not ready', state: whatsappState });
+    }
+
+    const jid = jidFromDestination(req.body?.to);
+    const caption = String(req.body?.caption || '').trim();
+    if (!jid) return res.status(400).json({ error: 'Invalid phone number or JID' });
+    if (caption.length > 5000) return res.status(400).json({ error: 'Caption is too long' });
+
+    const image = await resolveImageInput(req.body || {});
+    const sent = await sock.sendMessage(jid, {
+      image: image.buffer,
+      mimetype: image.mimetype,
+      ...(caption ? { caption } : {})
+    });
+    if (sent) cacheMessage(sent);
+
+    res.json({
+      ok: true,
+      id: sent?.key?.id || null,
+      to: jid,
+      timestamp: toNumber(sent?.messageTimestamp),
+      bytes: image.buffer.length,
+      mimetype: image.mimetype,
+      source: image.source
+    });
+  } catch (error) {
+    const message = error?.name === 'AbortError' ? 'Timed out downloading image' : error.message;
+    res.status(400).json({ error: message });
   }
 });
 
