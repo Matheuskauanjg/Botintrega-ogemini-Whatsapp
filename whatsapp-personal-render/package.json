@@ -1,6 +1,6 @@
 {
   "name": "whatsapp-personal-render",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "private": true,
   "type": "module",
   "description": "Personal WhatsApp bridge using Baileys with MCP support for ChatGPT plugins",
@@ -9,7 +9,7 @@
     "start": "node src/gateway-entry.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   },
   "dependencies": {
     "@modelcontextprotocol/node": "^2.0.0",
