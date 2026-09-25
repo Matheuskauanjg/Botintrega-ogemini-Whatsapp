@@ -56,17 +56,21 @@ await ensureBaileysAuthPath();
 process.env.PORT = String(bridgePort);
 await import('./server-media-v2.js');
 
-// 2) Proxy interno de handoff de áudio. Ele acrescenta uma URL temporária
-// assinada ao resultado de /api/audio e serve a mídia por poucos minutos.
+// 2) Proxy interno de áudio: Groq Whisper como principal e URL temporária
+// para WhisperAI apenas quando a transcrição principal falhar.
 const { startAudioHandoffProxy } = await import('./audio-handoff-proxy.js');
 startAudioHandoffProxy({ listenPort: audioHandoffPort, bridgePort });
 
-// 3) Gateway MCP/OAuth usa o handoff proxy como API interna. Todas as rotas
-// que não são de áudio apenas atravessam para o bridge original.
+// 3) Respostas automáticas controladas pelo número definido em
+// AUTO_REPLY_CONTROL_NUMBER. Começa OFF na primeira execução e persiste o estado.
+const { startAutoReplyService } = await import('./auto-reply-service.js');
+startAutoReplyService({ bridgePort, audioPort: audioHandoffPort });
+
+// 4) Gateway MCP/OAuth usa o proxy de áudio como API interna.
 const { startMcpGateway } = await import('./mcp-gateway-v5.js');
 await startMcpGateway({ publicPort: mcpGatewayPort, internalPort: audioHandoffPort });
 
-// 4) Proxy público na PORT do Render.
+// 5) Proxy público na PORT do Render.
 process.env.PORT = String(publicPort);
 const { startPublicMcpProxy } = await import('./public-mcp-proxy.js');
 startPublicMcpProxy({ publicPort, targetPort: mcpGatewayPort });
