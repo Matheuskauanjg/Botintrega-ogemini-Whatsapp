@@ -12,6 +12,8 @@ import makeWASocket, {
   getContentType,
   useMultiFileAuthState
 } from '@whiskeysockets/baileys';
+import { createPersistentStore } from './persistent-store.js';
+import { whatsappEvents } from './whatsapp-events.js';
 
 const app = express();
 app.use(express.json({ limit: '20mb' }));
@@ -20,6 +22,11 @@ const PORT = Number(process.env.PORT || 10000);
 const API_TOKEN = process.env.API_TOKEN || '';
 const QR_SECRET = process.env.QR_SECRET || '';
 const AUTH_PATH = process.env.BAILEYS_AUTH_PATH || path.resolve(process.cwd(), '.baileys_auth');
+const DB_PATH = process.env.WHATSAPP_DB_PATH || (
+  AUTH_PATH.startsWith('/data/') ? '/data/whatsapp.sqlite'
+    : AUTH_PATH.startsWith('/var/data/') ? '/var/data/whatsapp.sqlite'
+      : path.resolve(process.cwd(), 'whatsapp.sqlite')
+);
 const logger = pino({ level: process.env.BAILEYS_LOG_LEVEL || 'silent' });
 
 const MAX_MESSAGES_PER_CHAT = 300;
@@ -38,6 +45,7 @@ let socketGeneration = 0;
 const chats = new Map();
 const contacts = new Map();
 const messagesByChat = new Map();
+const persistentStore = createPersistentStore(DB_PATH);
 
 function requireApiToken(req, res, next) {
   if (!API_TOKEN) return res.status(503).json({ error: 'API_TOKEN is not configured' });
@@ -117,7 +125,9 @@ function serializeMessage(message) {
   return {
     id: message?.key?.id || null,
     chatId: message?.key?.remoteJid || null,
+    remoteJidAlt: message?.key?.remoteJidAlt || null,
     participant: message?.key?.participant || null,
+    participantAlt: message?.key?.participantAlt || null,
     fromMe: Boolean(message?.key?.fromMe),
     text: extractText(message),
     timestamp: toNumber(message?.messageTimestamp),
@@ -138,7 +148,7 @@ function serializeChat(chat) {
     id,
     name: chat?.name || contactName(id) || null,
     unreadCount: Number(chat?.unreadCount || 0),
-    timestamp: toNumber(chat?.conversationTimestamp),
+    timestamp: toNumber(chat?.conversationTimestamp ?? chat?.timestamp),
     archived: Boolean(chat?.archived),
     pinned: Boolean(chat?.pinned)
   };
@@ -147,18 +157,22 @@ function serializeChat(chat) {
 function upsertChat(chat) {
   const id = chat?.id || chat?.jid;
   if (!id) return;
-  chats.set(id, { ...(chats.get(id) || {}), ...chat, id });
+  const merged = { ...(chats.get(id) || {}), ...chat, id };
+  chats.set(id, merged);
+  persistentStore.upsertChat(serializeChat(merged));
 }
 
 function upsertContact(contact) {
   const id = contact?.id;
   if (!id) return;
-  contacts.set(id, { ...(contacts.get(id) || {}), ...contact });
+  const merged = { ...(contacts.get(id) || {}), ...contact };
+  contacts.set(id, merged);
+  persistentStore.upsertContact(merged);
 }
 
 function cacheMessage(message) {
   const jid = message?.key?.remoteJid;
-  if (!jid) return;
+  if (!jid) return null;
   const current = messagesByChat.get(jid) || [];
   const id = message?.key?.id;
   const withoutDuplicate = id ? current.filter(item => item?.key?.id !== id) : current;
@@ -168,12 +182,27 @@ function cacheMessage(message) {
     withoutDuplicate.splice(0, withoutDuplicate.length - MAX_MESSAGES_PER_CHAT);
   }
   messagesByChat.set(jid, withoutDuplicate);
-  upsertChat({ id: jid, conversationTimestamp: toNumber(message?.messageTimestamp) || Math.floor(Date.now() / 1000) });
+
+  const serialized = serializeMessage(message);
+  persistentStore.inferAndStoreMappings(message?.key);
+  persistentStore.upsertMessage(serialized, message);
+  upsertChat({ id: jid, conversationTimestamp: serialized.timestamp || Math.floor(Date.now() / 1000) });
+  return serialized;
 }
 
 function findMessage(chatId, messageId) {
   const items = messagesByChat.get(chatId) || [];
   return items.find(item => item?.key?.id === messageId) || null;
+}
+
+function findQuotedMessage(chatId, messageId) {
+  return findMessage(chatId, messageId) || persistentStore.getQuotedMessage(chatId, messageId);
+}
+
+function findMessageAuthor(chatId, messageId) {
+  const raw = findMessage(chatId, messageId);
+  if (raw) return raw?.key?.participant || raw?.key?.participantAlt || raw?.key?.remoteJidAlt || raw?.key?.remoteJid || null;
+  return persistentStore.getMessageAuthor(chatId, messageId);
 }
 
 function jidFromDestination(value) {
@@ -240,9 +269,6 @@ async function resolveImageInput(body) {
   if (!buffer?.length) throw new Error('Image is empty or invalid');
   if (buffer.length > MAX_IMAGE_INPUT_BYTES) throw new Error('Image exceeds 12 MB input limit');
 
-  // Normalize everything to a conservative WhatsApp-compatible JPEG. This avoids
-  // corrupt previews caused by mismatched MIME types, WebP/AVIF variants, EXIF
-  // orientation, or image URLs whose Content-Type does not match the bytes.
   let normalized = await sharp(buffer, { failOn: 'none', animated: false })
     .rotate()
     .resize({ width: 4096, height: 4096, fit: 'inside', withoutEnlargement: true })
@@ -303,6 +329,7 @@ async function connectWhatsApp() {
     auth: state,
     logger,
     markOnlineOnConnect: false,
+    emitOwnEvents: true,
     syncFullHistory: true,
     generateHighQualityLinkPreview: false
   });
@@ -311,9 +338,10 @@ async function connectWhatsApp() {
   console.log(`[Baileys] Socket iniciado. Auth: ${AUTH_PATH}`);
   currentSock.ev.on('creds.update', saveCreds);
 
-  currentSock.ev.on('messaging-history.set', ({ chats: historyChats, contacts: historyContacts, messages }) => {
+  currentSock.ev.on('messaging-history.set', ({ chats: historyChats, contacts: historyContacts, messages, lidPnMappings }) => {
     for (const chat of historyChats || []) upsertChat(chat);
     for (const contact of historyContacts || []) upsertContact(contact);
+    for (const mapping of lidPnMappings || []) persistentStore.upsertLidMapping(mapping?.lid, mapping?.pn);
     for (const message of messages || []) cacheMessage(message);
     console.log(`[Baileys] Histórico: ${historyChats?.length || 0} chats, ${messages?.length || 0} mensagens.`);
   });
@@ -321,7 +349,21 @@ async function connectWhatsApp() {
   currentSock.ev.on('chats.update', update => { for (const chat of update || []) upsertChat(chat); });
   currentSock.ev.on('contacts.upsert', update => { for (const contact of update || []) upsertContact(contact); });
   currentSock.ev.on('contacts.update', update => { for (const contact of update || []) upsertContact(contact); });
-  currentSock.ev.on('messages.upsert', ({ messages }) => { for (const message of messages || []) cacheMessage(message); });
+  currentSock.ev.on('lid-mapping.update', mapping => {
+    if (mapping) persistentStore.upsertLidMapping(mapping.lid, mapping.pn);
+  });
+  currentSock.ev.on('messages.upsert', ({ messages, type }) => {
+    for (const message of messages || []) {
+      const serialized = cacheMessage(message);
+      if (!serialized?.id || !serialized?.chatId) continue;
+      const chat = serializeChat(chats.get(serialized.chatId) || {
+        id: serialized.chatId,
+        name: contactName(serialized.chatId),
+        conversationTimestamp: serialized.timestamp
+      });
+      whatsappEvents.emit('message', { message: serialized, chat, upsertType: type || null });
+    }
+  });
 
   currentSock.ev.on('connection.update', async update => {
     if (generation !== socketGeneration) return;
@@ -349,6 +391,7 @@ async function connectWhatsApp() {
       lastError = null;
       me = currentSock.user ? { id: currentSock.user.id || null, name: currentSock.user.name || null } : null;
       console.log('[Baileys] WhatsApp conectado.');
+      whatsappEvents.emit('ready', { me });
       return;
     }
 
@@ -375,12 +418,32 @@ async function connectWhatsApp() {
   });
 }
 
+function normalizeMentions(values) {
+  const input = Array.isArray(values) ? values : [];
+  const unique = new Set();
+  for (const value of input) {
+    const jid = jidFromDestination(value);
+    if (!jid) continue;
+    unique.add(persistentStore.resolvePreferredJid(jid));
+  }
+  return Array.from(unique);
+}
+
+function withVisibleMentionPrefix(message, mentions, enabled = true) {
+  if (!enabled || !mentions.length) return message;
+  const missing = mentions
+    .map(jid => String(jid).split('@')[0])
+    .filter(number => number && !message.includes(`@${number}`));
+  if (!missing.length) return message;
+  return `${missing.map(number => `@${number}`).join(' ')} ${message}`.trim();
+}
+
 app.get('/', (_req, res) => {
   res.type('html').send(`<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WhatsApp Personal Bridge</title></head><body style="font-family:Arial,sans-serif;max-width:760px;margin:40px auto;padding:0 20px"><h1>WhatsApp Personal Bridge · Media v2</h1><p>Status: <strong>${whatsappState}</strong></p><p><a href="/qr">Abrir QR Code</a></p></body></html>`);
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'whatsapp-personal-render-media-v2', whatsappState, ready: isReady(), hasQr: Boolean(latestQrDataUrl), qrGeneratedAt: latestQrAt, cachedChats: chats.size, authPath: AUTH_PATH, lastError });
+  res.json({ ok: true, service: 'whatsapp-personal-render-media-v2', whatsappState, ready: isReady(), hasQr: Boolean(latestQrDataUrl), qrGeneratedAt: latestQrAt, cachedChats: chats.size, authPath: AUTH_PATH, database: persistentStore.stats(), lastError });
 });
 
 app.get('/qr', (req, res) => {
@@ -410,46 +473,92 @@ app.post('/qr/reset', requireQrSecret, async (_req, res) => {
 });
 
 app.get('/api/status', requireApiToken, (_req, res) => {
-  res.json({ state: whatsappState, ready: isReady(), me, cachedChats: chats.size, authPath: AUTH_PATH, lastError });
+  res.json({ state: whatsappState, ready: isReady(), me, cachedChats: chats.size, authPath: AUTH_PATH, database: persistentStore.stats(), lastError });
 });
 
 app.get('/api/chats', requireApiToken, (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit || 30), 1), 100);
-  const result = Array.from(chats.values()).map(serializeChat).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)).slice(0, limit);
+  const merged = new Map(persistentStore.listChats(300).map(chat => [chat.id, chat]));
+  for (const chat of chats.values()) {
+    const serialized = serializeChat(chat);
+    merged.set(serialized.id, { ...(merged.get(serialized.id) || {}), ...serialized });
+  }
+  const result = Array.from(merged.values()).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)).slice(0, limit);
   res.json({ chats: result });
 });
 
 app.get('/api/chats/:chatId/messages', requireApiToken, (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit || 30), 1), 100);
-  const items = (messagesByChat.get(req.params.chatId) || []).slice(-limit).map(serializeMessage);
+  const items = persistentStore.listMessages(req.params.chatId, limit);
   res.json({ chatId: req.params.chatId, messages: items });
 });
 
 app.get('/api/search', requireApiToken, (req, res) => {
-  const q = String(req.query.q || '').trim().toLowerCase();
+  const q = String(req.query.q || '').trim();
   if (!q) return res.status(400).json({ error: 'Query parameter q is required' });
-  const results = [];
-  for (const [chatId, items] of messagesByChat.entries()) {
-    for (const message of items) {
-      const serialized = serializeMessage(message);
-      if ((serialized.text || '').toLowerCase().includes(q)) results.push({ chatId, message: serialized });
-    }
-  }
-  results.sort((a, b) => (b.message.timestamp || 0) - (a.message.timestamp || 0));
-  res.json({ query: q, results: results.slice(0, 100) });
+  res.json({ query: q, results: persistentStore.searchMessages(q, 100) });
+});
+
+app.get('/api/db-stats', requireApiToken, (_req, res) => {
+  res.json({ ok: true, ...persistentStore.stats() });
 });
 
 app.post('/api/send', requireApiToken, async (req, res) => {
+  const startedAt = performance.now();
   try {
     if (!isReady()) return res.status(409).json({ error: 'WhatsApp is not ready', state: whatsappState });
     const jid = jidFromDestination(req.body?.to);
-    const message = String(req.body?.message || '').trim();
+    let message = String(req.body?.message || '').trim();
     if (!jid) return res.status(400).json({ error: 'Invalid phone number or JID' });
     if (!message) return res.status(400).json({ error: 'Message is required' });
     if (message.length > 5000) return res.status(400).json({ error: 'Message is too long' });
-    const sent = await sock.sendMessage(jid, { text: message });
+
+    const replyToMessageId = String(req.body?.replyToMessageId || '').trim();
+    const mentionAuthorOfMessageId = String(req.body?.mentionAuthorOfMessageId || '').trim();
+    const mentions = normalizeMentions(req.body?.mentionJids);
+
+    let quoted = null;
+    if (replyToMessageId) {
+      quoted = findQuotedMessage(jid, replyToMessageId);
+      if (!quoted) return res.status(404).json({ error: 'Message to reply to was not found in cache or persistent history' });
+    }
+
+    if (mentionAuthorOfMessageId) {
+      const author = findMessageAuthor(jid, mentionAuthorOfMessageId);
+      if (!author) return res.status(404).json({ error: 'Message author was not found' });
+      const resolved = persistentStore.resolvePreferredJid(author);
+      if (resolved && !mentions.includes(resolved)) mentions.push(resolved);
+    }
+
+    message = withVisibleMentionPrefix(message, mentions, req.body?.prependMentions !== false);
+    const content = { text: message, ...(mentions.length ? { mentions } : {}) };
+    const sent = await sock.sendMessage(jid, content, quoted ? { quoted } : undefined);
     if (sent) cacheMessage(sent);
-    res.json({ ok: true, id: sent?.key?.id || null, to: jid, timestamp: toNumber(sent?.messageTimestamp) });
+    const latencyMs = Math.round(performance.now() - startedAt);
+    console.log(`[Send] text to=${jid} latency=${latencyMs}ms reply=${Boolean(quoted)} mentions=${mentions.length}`);
+    res.json({ ok: true, id: sent?.key?.id || null, to: jid, timestamp: toNumber(sent?.messageTimestamp), replyToMessageId: replyToMessageId || null, mentions, latencyMs });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/react', requireApiToken, async (req, res) => {
+  const startedAt = performance.now();
+  try {
+    if (!isReady()) return res.status(409).json({ error: 'WhatsApp is not ready', state: whatsappState });
+    const jid = jidFromDestination(req.body?.to);
+    const messageId = String(req.body?.messageId || '').trim();
+    const emoji = String(req.body?.emoji ?? '').trim();
+    if (!jid) return res.status(400).json({ error: 'Invalid phone number or JID' });
+    if (!messageId) return res.status(400).json({ error: 'messageId is required' });
+    if (emoji.length > 20) return res.status(400).json({ error: 'Reaction is too long' });
+    const target = findQuotedMessage(jid, messageId);
+    if (!target?.key) return res.status(404).json({ error: 'Message to react to was not found' });
+    const sent = await sock.sendMessage(jid, { react: { text: emoji, key: target.key } });
+    if (sent) cacheMessage(sent);
+    const latencyMs = Math.round(performance.now() - startedAt);
+    console.log(`[Send] reaction to=${jid} message=${messageId} latency=${latencyMs}ms`);
+    res.json({ ok: true, to: jid, messageId, emoji, latencyMs });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -459,13 +568,23 @@ app.post('/api/send-image', requireApiToken, async (req, res) => {
   try {
     if (!isReady()) return res.status(409).json({ error: 'WhatsApp is not ready', state: whatsappState });
     const jid = jidFromDestination(req.body?.to);
-    const caption = String(req.body?.caption || '').trim();
+    let caption = String(req.body?.caption || '').trim();
     if (!jid) return res.status(400).json({ error: 'Invalid phone number or JID' });
     if (caption.length > 5000) return res.status(400).json({ error: 'Caption is too long' });
     const image = await resolveImageInput(req.body || {});
-    const sent = await sock.sendMessage(jid, { image: image.buffer, mimetype: 'image/jpeg', ...(caption ? { caption } : {}) });
+    const replyToMessageId = String(req.body?.replyToMessageId || '').trim();
+    const mentions = normalizeMentions(req.body?.mentionJids);
+    const quoted = replyToMessageId ? findQuotedMessage(jid, replyToMessageId) : null;
+    if (replyToMessageId && !quoted) return res.status(404).json({ error: 'Message to reply to was not found' });
+    caption = withVisibleMentionPrefix(caption, mentions, req.body?.prependMentions !== false);
+    const sent = await sock.sendMessage(jid, {
+      image: image.buffer,
+      mimetype: 'image/jpeg',
+      ...(caption ? { caption } : {}),
+      ...(mentions.length ? { mentions } : {})
+    }, quoted ? { quoted } : undefined);
     if (sent) cacheMessage(sent);
-    res.json({ ok: true, id: sent?.key?.id || null, to: jid, timestamp: toNumber(sent?.messageTimestamp), bytes: image.buffer.length, mimetype: 'image/jpeg', source: image.source, normalized: true });
+    res.json({ ok: true, id: sent?.key?.id || null, to: jid, timestamp: toNumber(sent?.messageTimestamp), bytes: image.buffer.length, mimetype: 'image/jpeg', source: image.source, normalized: true, replyToMessageId: replyToMessageId || null, mentions });
   } catch (error) {
     const message = error?.name === 'AbortError' ? 'Timed out downloading image' : error.message;
     console.error('[Media] send-image error:', message);
@@ -481,7 +600,7 @@ app.post('/api/audio', requireApiToken, async (req, res) => {
     if (!chatId || !messageId) return res.status(400).json({ error: 'chatId and messageId are required' });
 
     const message = findMessage(chatId, messageId);
-    if (!message) return res.status(404).json({ error: 'Audio message is not present in the in-memory cache' });
+    if (!message) return res.status(404).json({ error: 'Audio message is not present in the in-memory media cache; text history remains persisted' });
     const content = normalizeMessageContent(message);
     const info = audioInfo(content);
     if (!info) return res.status(400).json({ error: 'Selected message is not an audio message' });
@@ -516,6 +635,7 @@ app.post('/api/audio', requireApiToken, async (req, res) => {
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`[HTTP] Media v2 listening on 0.0.0.0:${PORT}`);
   console.log(`[Baileys] Auth path: ${AUTH_PATH}`);
+  console.log(`[SQLite] Persistent history: ${persistentStore.path}`);
   connectWhatsApp().catch(error => {
     whatsappState = 'initialization_error';
     lastError = error.message;
@@ -529,6 +649,7 @@ async function shutdown(signal) {
   clearTimeout(reconnectTimer);
   socketGeneration += 1;
   try { sock?.end?.(new Error('server shutdown')); } catch (_) {}
+  try { persistentStore.close(); } catch (_) {}
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 3000).unref();
 }
