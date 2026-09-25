@@ -18,12 +18,13 @@ const legacyAuthPath = process.env.WWEBJS_AUTH_PATH
   : null;
 
 const configuredAuthPath = process.env.BAILEYS_AUTH_PATH || legacyAuthPath || null;
-const persistentAuthPath = '/var/data/baileys_auth';
+const railwayAuthPath = '/data/baileys_auth';
+const legacyPersistentAuthPath = '/var/data/baileys_auth';
 const localAuthPath = path.resolve(process.cwd(), '.baileys_auth');
 const candidates = [];
 
 if (configuredAuthPath && !configuredAuthPath.startsWith('/tmp/')) candidates.push(configuredAuthPath);
-candidates.push(persistentAuthPath);
+candidates.push(railwayAuthPath, legacyPersistentAuthPath);
 if (configuredAuthPath) candidates.push(configuredAuthPath);
 candidates.push(localAuthPath, '/tmp/baileys_auth');
 
@@ -37,11 +38,7 @@ async function ensureBaileysAuthPath() {
       await fs.access(candidate);
       process.env.BAILEYS_AUTH_PATH = candidate;
       console.log(`[Gateway] Baileys auth path: ${candidate}`);
-      if (candidate.startsWith('/tmp/')) {
-        console.warn('[Gateway] Sessão em /tmp é efêmera. Anexe um Persistent Disk no Render em /var/data para manter o login entre deploys.');
-      } else if (candidate === persistentAuthPath) {
-        console.log('[Gateway] Sessão do WhatsApp usando armazenamento persistente em /var/data.');
-      }
+      if (candidate.startsWith('/tmp/')) console.warn('[Gateway] Sessão em /tmp é efêmera; use um volume persistente.');
       return candidate;
     } catch (error) {
       console.warn(`[Gateway] Auth path indisponível: ${candidate} (${error.code || error.message})`);
@@ -52,25 +49,23 @@ async function ensureBaileysAuthPath() {
 
 await ensureBaileysAuthPath();
 
-// 1) Bridge REST/Baileys em localhost:10001.
+// 1) Bridge REST/Baileys local.
 process.env.PORT = String(bridgePort);
 await import('./server-media-v2.js');
 
-// 2) Proxy interno de áudio: Groq Whisper como principal e URL temporária
-// para WhisperAI apenas quando a transcrição principal falhar.
+// 2) Proxy de áudio: Groq Whisper como principal e URL temporária para fallback.
 const { startAudioHandoffProxy } = await import('./audio-handoff-proxy.js');
 startAudioHandoffProxy({ listenPort: audioHandoffPort, bridgePort });
 
-// 3) Respostas automáticas controladas pelo número definido em
-// AUTO_REPLY_CONTROL_NUMBER. Começa OFF na primeira execução e persiste o estado.
+// 3) Auto reply orientado a eventos do Baileys, com fallback apenas para o comando de controle.
 const { startAutoReplyService } = await import('./auto-reply-service.js');
 startAutoReplyService({ bridgePort, audioPort: audioHandoffPort });
 
-// 4) Gateway MCP/OAuth usa o proxy de áudio como API interna.
+// 4) MCP/OAuth: texto e histórico vão direto ao bridge; áudio usa o proxy de transcrição.
 const { startMcpGateway } = await import('./mcp-gateway-v5.js');
-await startMcpGateway({ publicPort: mcpGatewayPort, internalPort: audioHandoffPort });
+await startMcpGateway({ publicPort: mcpGatewayPort, bridgePort, audioPort: audioHandoffPort });
 
-// 5) Proxy público na PORT do Render.
+// 5) Proxy público de compatibilidade do ChatGPT.
 process.env.PORT = String(publicPort);
 const { startPublicMcpProxy } = await import('./public-mcp-proxy.js');
 startPublicMcpProxy({ publicPort, targetPort: mcpGatewayPort });
