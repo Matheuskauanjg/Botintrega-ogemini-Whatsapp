@@ -2,6 +2,8 @@ import http from 'node:http';
 import { createAudioShare, getAudioShare } from './audio-share-store.js';
 
 const MAX_JSON_BYTES = 20 * 1024 * 1024;
+const GROQ_TRANSCRIBE_URL = 'https://api.groq.com/openai/v1/audio/transcriptions';
+const DEFAULT_GROQ_MODEL = 'whisper-large-v3-turbo';
 
 function publicBaseUrl() {
   return String(process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
@@ -25,6 +27,113 @@ function audioTokenFromPath(urlText) {
   } catch {
     return null;
   }
+}
+
+function groqAudioMime(value) {
+  const raw = String(value || '').toLowerCase();
+  if (raw.includes('webm')) return { mime: 'audio/webm', ext: 'webm' };
+  if (raw.includes('mpeg') || raw.includes('mp3')) return { mime: 'audio/mpeg', ext: 'mp3' };
+  if (raw.includes('wav')) return { mime: 'audio/wav', ext: 'wav' };
+  if (raw.includes('mp4') || raw.includes('m4a')) return { mime: 'audio/mp4', ext: 'm4a' };
+  if (raw.includes('flac')) return { mime: 'audio/flac', ext: 'flac' };
+  return { mime: 'audio/ogg', ext: 'ogg' };
+}
+
+async function transcribeWithGroq(audio, mimetype, messageId) {
+  const apiKey = String(process.env.GROQ_API_KEY || '').trim();
+  const model = String(process.env.GROQ_TRANSCRIBE_MODEL || DEFAULT_GROQ_MODEL).trim() || DEFAULT_GROQ_MODEL;
+  const language = String(process.env.GROQ_TRANSCRIBE_LANGUAGE || '').trim();
+
+  if (!apiKey) {
+    return {
+      ok: false,
+      provider: 'groq',
+      model,
+      reason: 'not_configured',
+      error: 'GROQ_API_KEY is not configured.'
+    };
+  }
+
+  const { mime, ext } = groqAudioMime(mimetype);
+  const safeMessageId = String(messageId || 'audio').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80) || 'audio';
+  const form = new FormData();
+  form.set('model', model);
+  form.set('response_format', 'json');
+  form.set('temperature', '0');
+  if (language) form.set('language', language);
+  form.set('file', new Blob([audio], { type: mime }), `whatsapp-${safeMessageId}.${ext}`);
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+
+  try {
+    const response = await fetch(GROQ_TRANSCRIBE_URL, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${apiKey}` },
+      body: form,
+      signal: controller.signal
+    });
+
+    const raw = await response.text();
+    let payload;
+    try { payload = raw ? JSON.parse(raw) : {}; }
+    catch { payload = { raw }; }
+
+    if (!response.ok) {
+      const detail = payload?.error?.message || payload?.message || `HTTP ${response.status}`;
+      return {
+        ok: false,
+        provider: 'groq',
+        model,
+        reason: response.status === 429 ? 'rate_limited' : 'api_error',
+        statusCode: response.status,
+        error: String(detail).slice(0, 500)
+      };
+    }
+
+    const transcript = String(payload?.text || '').trim();
+    if (!transcript) {
+      return {
+        ok: false,
+        provider: 'groq',
+        model,
+        reason: 'empty_transcript',
+        error: 'Groq returned an empty transcript.'
+      };
+    }
+
+    return {
+      ok: true,
+      provider: 'groq',
+      model,
+      transcript
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      provider: 'groq',
+      model,
+      reason: error?.name === 'AbortError' ? 'timeout' : 'network_error',
+      error: error?.name === 'AbortError' ? 'Groq transcription timed out.' : String(error?.message || error).slice(0, 500)
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function addWhisperFallback(data, audio) {
+  const share = createAudioShare({
+    buffer: audio,
+    mimetype: data.mimetype || 'audio/ogg; codecs=opus',
+    filename: `whatsapp-${String(data.messageId || 'audio')}.ogg`
+  });
+  const base = publicBaseUrl();
+  data.audioUrl = base ? `${base}/media/audio/${share.token}.ogg` : `/media/audio/${share.token}.ogg`;
+  data.audioUrlExpiresAt = new Date(share.expiresAt).toISOString();
+  data.audioUrlTtlSeconds = Math.max(0, Math.floor((share.expiresAt - Date.now()) / 1000));
+  data.fallbackProvider = 'whisperai';
+  data.whisperHandoff = 'Groq transcription was unavailable. Use the connected WhisperAI transcribe_url tool with audioUrl.';
+  console.log(`[AudioShare] WhisperAI fallback URL criada para message=${String(data.messageId || '(unknown)')} bytes=${audio.length}`);
 }
 
 export function startAudioHandoffProxy({ listenPort, bridgePort }) {
@@ -64,14 +173,14 @@ export function startAudioHandoffProxy({ listenPort, bridgePort }) {
           sendJson(res, 413, { error: 'Request too large' });
           return;
         }
-        forwardAudioRequest(Buffer.concat(chunks));
+        void forwardAudioRequest(Buffer.concat(chunks));
       });
       return;
     }
 
     streamToBridge();
 
-    function forwardAudioRequest(body) {
+    async function forwardAudioRequest(body) {
       const headers = { ...req.headers, host: `127.0.0.1:${bridgePort}`, 'content-length': String(body.length) };
       delete headers.connection;
       const upstream = http.request({
@@ -87,7 +196,7 @@ export function startAudioHandoffProxy({ listenPort, bridgePort }) {
           responseSize += chunk.length;
           if (responseSize <= MAX_JSON_BYTES) responseChunks.push(chunk);
         });
-        upstreamRes.on('end', () => {
+        upstreamRes.on('end', async () => {
           if (responseSize > MAX_JSON_BYTES) {
             sendJson(res, 502, { error: 'Audio response too large' });
             return;
@@ -103,20 +212,29 @@ export function startAudioHandoffProxy({ listenPort, bridgePort }) {
             const data = JSON.parse(raw.toString('utf8'));
             const audio = Buffer.from(String(data.audioBase64 || ''), 'base64');
             if (!audio.length) throw new Error('Audio payload is empty');
-            const share = createAudioShare({
-              buffer: audio,
-              mimetype: data.mimetype || 'audio/ogg; codecs=opus',
-              filename: `whatsapp-${String(data.messageId || 'audio')}.ogg`
-            });
-            const base = publicBaseUrl();
-            data.audioUrl = base ? `${base}/media/audio/${share.token}.ogg` : `/media/audio/${share.token}.ogg`;
-            data.audioUrlExpiresAt = new Date(share.expiresAt).toISOString();
-            data.audioUrlTtlSeconds = Math.max(0, Math.floor((share.expiresAt - Date.now()) / 1000));
-            data.whisperHandoff = 'Use WhisperAI transcribe_url with audioUrl.';
-            console.log(`[AudioShare] URL temporária criada para message=${String(data.messageId || '(unknown)')} bytes=${audio.length}`);
+
+            const transcription = await transcribeWithGroq(audio, data.mimetype, data.messageId);
+            data.transcriptionProvider = 'groq';
+            data.transcriptionModel = transcription.model;
+
+            if (transcription.ok) {
+              data.transcriptionStatus = 'ok';
+              data.transcript = transcription.transcript;
+              data.fallbackProvider = 'whisperai';
+              console.log(`[Audio] Groq transcription ok message=${String(data.messageId || '(unknown)')} chars=${transcription.transcript.length}`);
+            } else {
+              data.transcriptionStatus = 'fallback_required';
+              data.transcript = null;
+              data.transcriptionReason = transcription.reason;
+              data.transcriptionError = transcription.error;
+              if (transcription.statusCode) data.transcriptionHttpStatus = transcription.statusCode;
+              addWhisperFallback(data, audio);
+              console.warn(`[Audio] Groq indisponível (${transcription.reason}); fallback WhisperAI preparado para message=${String(data.messageId || '(unknown)')}`);
+            }
+
             sendJson(res, 200, data);
           } catch (error) {
-            console.warn('[AudioShare] Falha ao preparar URL temporária:', error?.message || error);
+            console.warn('[Audio] Falha ao processar transcrição/fallback:', error?.message || error);
             res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
             res.end(raw);
           }
@@ -148,7 +266,8 @@ export function startAudioHandoffProxy({ listenPort, bridgePort }) {
   });
 
   server.listen(listenPort, '127.0.0.1', () => {
-    console.log(`[AudioShare] Internal handoff proxy listening on 127.0.0.1:${listenPort} -> bridge ${bridgePort}`);
+    console.log(`[Audio] Internal transcription proxy listening on 127.0.0.1:${listenPort} -> bridge ${bridgePort}`);
+    console.log(`[Audio] Primary: Groq ${String(process.env.GROQ_TRANSCRIBE_MODEL || DEFAULT_GROQ_MODEL)} | Fallback: WhisperAI temporary URL`);
   });
 
   return server;
