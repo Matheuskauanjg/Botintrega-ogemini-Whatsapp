@@ -1,9 +1,15 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { whatsappEvents } from './whatsapp-events.js';
 
 const GROQ_CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const DEFAULT_REPLY_MODEL = 'openai/gpt-oss-20b';
-const POLL_MS = 2500;
+
+function clampNumber(value, fallback, min, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(Math.max(parsed, min), max);
+}
 
 function normalizeNumber(value) {
   let digits = String(value || '').replace(/\D/g, '');
@@ -14,13 +20,11 @@ function normalizeNumber(value) {
 function normalizeControlJid(value) {
   const raw = String(value || '').trim();
   if (!raw) return '';
-
   if (raw.includes('@')) {
     const match = raw.match(/^([0-9]+)@(s\.whatsapp\.net|lid)$/i);
     if (!match) return '';
     return `${match[1]}@${match[2].toLowerCase()}`;
   }
-
   const number = normalizeNumber(raw);
   return number ? `${number}@s.whatsapp.net` : '';
 }
@@ -46,6 +50,11 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function randomBetween(min, max) {
+  if (max <= min) return min;
+  return min + Math.floor(Math.random() * (max - min + 1));
+}
+
 function cleanReply(value) {
   return String(value || '')
     .trim()
@@ -59,7 +68,6 @@ function splitReply(value) {
     .split(/\n+/)
     .map(part => part.trim())
     .filter(Boolean);
-
   if (!parts.length) return [];
   return parts.slice(0, 3);
 }
@@ -75,7 +83,6 @@ function buildMatheusStylePrompt(contactName, extraStyle = '') {
     'Use principalmente as mensagens anteriores com role assistant como exemplos reais do jeito que Matheus escreve com esse contato.',
     'Jeito padrão do Matheus em conversa casual: curto, direto, informal, geralmente em minúsculas, sem português excessivamente polido. Quando combinar com o contexto, use abreviações naturais como vc, pq, blz e risadas como kkk/kkkkk.',
     'Ele costuma mandar pensamentos em mensagens curtas em sequência. Você pode retornar até 3 linhas curtas; cada linha será enviada como uma mensagem separada.',
-    'Exemplos de tom casual dele: "nem sei que ideia é essa", "mas blz", "assustador", "kkkkkk talento tem", "marca essa reunião aí antes que a IA domine primeiro kkkkk".',
     'Não force gíria, palavrão, carinho ou risada. Só use quando o histórico e a mensagem atual indicarem esse tom.',
     'Adapte o tom ao contato: em trabalho/comercial seja simples, educado e objetivo; com amigos pode ser mais solto e zoeiro; em conversa afetiva acompanhe o nível de carinho que já existe no histórico.',
     'Evite respostas genéricas como "Oi! Como posso ajudar?", "estou online", "sou uma IA", "sou um bot" ou qualquer frase que revele automação.',
@@ -98,16 +105,29 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
   const REPLY_MODEL = String(process.env.GROQ_REPLY_MODEL || DEFAULT_REPLY_MODEL).trim() || DEFAULT_REPLY_MODEL;
   const PREFIX = String(process.env.AUTO_REPLY_PREFIX ?? '').slice(0, 30);
   const EXTRA_STYLE = String(process.env.AUTO_REPLY_STYLE || '').trim().slice(0, 1500);
-  const statePath = process.env.AUTO_REPLY_STATE_PATH || (String(process.env.BAILEYS_AUTH_PATH || '').startsWith('/var/data/')
-    ? '/var/data/whatsapp-auto-reply.json'
-    : path.resolve(process.cwd(), '.whatsapp-auto-reply.json'));
+  const DELAY_MIN_MS = clampNumber(process.env.AUTO_REPLY_DELAY_MIN_MS, 250, 0, 10000);
+  const DELAY_MAX_MS = Math.max(DELAY_MIN_MS, clampNumber(process.env.AUTO_REPLY_DELAY_MAX_MS, 750, 0, 15000));
+  const DEBOUNCE_MS = clampNumber(process.env.AUTO_REPLY_DEBOUNCE_MS, 350, 50, 5000);
+  const CONCURRENCY = Math.round(clampNumber(process.env.AUTO_REPLY_CONCURRENCY, 4, 1, 12));
+  const INTERPART_MIN_MS = clampNumber(process.env.AUTO_REPLY_INTERPART_MIN_MS, 150, 0, 5000);
+  const INTERPART_MAX_MS = Math.max(INTERPART_MIN_MS, clampNumber(process.env.AUTO_REPLY_INTERPART_MAX_MS, 350, 0, 7000));
+  const CONTROL_FALLBACK_MS = 15000;
+  const authPath = String(process.env.BAILEYS_AUTH_PATH || '');
+  const statePath = process.env.AUTO_REPLY_STATE_PATH || (
+    authPath.startsWith('/data/') ? '/data/whatsapp-auto-reply.json'
+      : authPath.startsWith('/var/data/') ? '/var/data/whatsapp-auto-reply.json'
+        : path.resolve(process.cwd(), '.whatsapp-auto-reply.json')
+  );
 
   let state = { enabled: false, enabledAt: 0, lastControlMessageId: null };
-  let timer = null;
   let stopped = false;
+  let initialized = false;
+  let activeWorkers = 0;
+  let controlFallbackTimer = null;
   const processed = new Set();
-  const busy = new Set();
-  const lastChatTimestamp = new Map();
+  const pendingChats = new Map();
+  const debounceTimers = new Map();
+  const latestIncomingId = new Map();
   const startedAt = Math.floor(Date.now() / 1000);
 
   async function api(base, pathname, options = {}) {
@@ -153,32 +173,43 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
     return Boolean(CONTROL_JID) && String(jid || '').toLowerCase() === CONTROL_JID.toLowerCase();
   }
 
-  async function checkControl() {
-    if (!CONTROL_JID) return;
-    const data = await bridge(`/api/chats/${encodeURIComponent(CONTROL_JID)}/messages?limit=12`);
-    const messages = Array.isArray(data?.messages) ? data.messages : [];
-    for (const message of messages) {
-      if (!message?.fromMe || !message?.id || message.id === state.lastControlMessageId) continue;
-      const command = parseCommand(message.text);
-      if (!command) continue;
-      state.lastControlMessageId = message.id;
-      if (command === 'on') {
-        state.enabled = true;
-        state.enabledAt = Math.floor(Date.now() / 1000);
-        processed.clear();
-        lastChatTimestamp.clear();
-        await saveState();
-        await send(CONTROL_JID, '🤖 Respostas automáticas: ON');
-        console.log('[AutoReply] ON');
-      } else if (command === 'off') {
-        state.enabled = false;
-        await saveState();
-        await send(CONTROL_JID, '🔕 Respostas automáticas: OFF');
-        console.log('[AutoReply] OFF');
-      } else {
-        await saveState();
-        await send(CONTROL_JID, state.enabled ? '🤖 Respostas automáticas estão ON' : '🔕 Respostas automáticas estão OFF');
-      }
+  async function applyControlCommand(message) {
+    if (!message?.fromMe || !message?.id || message.id === state.lastControlMessageId) return false;
+    const command = parseCommand(message.text);
+    if (!command) return false;
+
+    state.lastControlMessageId = message.id;
+    if (command === 'on') {
+      state.enabled = true;
+      state.enabledAt = Math.floor(Date.now() / 1000);
+      processed.clear();
+      latestIncomingId.clear();
+      await saveState();
+      await send(CONTROL_JID, '🤖 Respostas automáticas: ON');
+      console.log('[AutoReply] ON');
+    } else if (command === 'off') {
+      state.enabled = false;
+      pendingChats.clear();
+      for (const timer of debounceTimers.values()) clearTimeout(timer);
+      debounceTimers.clear();
+      await saveState();
+      await send(CONTROL_JID, '🔕 Respostas automáticas: OFF');
+      console.log('[AutoReply] OFF');
+    } else {
+      await saveState();
+      await send(CONTROL_JID, state.enabled ? '🤖 Respostas automáticas estão ON' : '🔕 Respostas automáticas estão OFF');
+    }
+    return true;
+  }
+
+  async function checkControlFallback() {
+    if (!CONTROL_JID || stopped || !initialized) return;
+    try {
+      const data = await bridge(`/api/chats/${encodeURIComponent(CONTROL_JID)}/messages?limit=12`);
+      const messages = Array.isArray(data?.messages) ? data.messages : [];
+      for (const message of messages) await applyControlCommand(message);
+    } catch (error) {
+      console.warn('[AutoReply] control fallback failed:', error?.message || error);
     }
   }
 
@@ -189,118 +220,164 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
 
   async function createReply(messages, currentText, chat) {
     if (!GROQ_API_KEY) throw new Error('GROQ_API_KEY is not configured');
-
     const history = messages.slice(-24).flatMap(message => {
       const text = String(message?.text || '').trim();
       if (!text) return [];
       return [{ role: message.fromMe ? 'assistant' : 'user', content: text.slice(0, 900) }];
     });
-
-    if (!history.length || history.at(-1)?.role !== 'user') {
-      history.push({ role: 'user', content: currentText });
-    }
+    if (!history.length || history.at(-1)?.role !== 'user') history.push({ role: 'user', content: currentText });
 
     const contactName = String(chat?.name || chat?.pushName || '').trim().slice(0, 120);
     const systemPrompt = buildMatheusStylePrompt(contactName, EXTRA_STYLE);
-
+    const started = performance.now();
     const response = await fetch(GROQ_CHAT_URL, {
       method: 'POST',
       headers: { authorization: `Bearer ${GROQ_API_KEY}`, 'content-type': 'application/json' },
       body: JSON.stringify({
         model: REPLY_MODEL,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          ...history
-        ],
+        messages: [{ role: 'system', content: systemPrompt }, ...history],
         temperature: 0.82,
         max_completion_tokens: 180
       })
     });
-
     const payload = await response.json();
     if (!response.ok) throw new Error(payload?.error?.message || `Groq HTTP ${response.status}`);
+    console.log(`[AutoReply] Groq latency=${Math.round(performance.now() - started)}ms`);
     return cleanReply(payload?.choices?.[0]?.message?.content);
+  }
+
+  function rememberProcessed(messages) {
+    for (const message of messages) if (message?.id) processed.add(message.id);
+    if (processed.size > 6000) {
+      const keep = Array.from(processed).slice(-3000);
+      processed.clear();
+      for (const id of keep) processed.add(id);
+    }
   }
 
   async function processChat(chat) {
     const chatId = String(chat?.id || '');
-    if (!isDirectChatJid(chatId) || isControlChat(chatId) || busy.has(chatId)) return;
+    if (!state.enabled || !isDirectChatJid(chatId) || isControlChat(chatId)) return;
 
     const cutoff = Math.max(startedAt, Number(state.enabledAt || 0));
-    const chatTimestamp = Number(chat?.timestamp || 0);
-    if (chatTimestamp && chatTimestamp < cutoff) {
-      lastChatTimestamp.set(chatId, chatTimestamp);
-      return;
-    }
-    if (chatTimestamp && lastChatTimestamp.get(chatId) === chatTimestamp) return;
-
     const data = await bridge(`/api/chats/${encodeURIComponent(chatId)}/messages?limit=30`);
     const messages = Array.isArray(data?.messages) ? data.messages : [];
-    if (chatTimestamp) lastChatTimestamp.set(chatId, chatTimestamp);
-
     const incoming = messages.filter(message => message?.id && !message.fromMe && Number(message.timestamp || 0) >= cutoff && !processed.has(message.id));
     if (!incoming.length) return;
 
-    for (const message of incoming) processed.add(message.id);
-    if (processed.size > 4000) processed.clear();
     const current = incoming.at(-1);
-    busy.add(chatId);
+    rememberProcessed(incoming);
+    latestIncomingId.set(chatId, current.id);
+    const eventStartedAt = performance.now();
 
-    try {
-      let text = String(current?.text || '').trim();
-      if (!text && current?.audio?.available) text = await transcribe(chatId, current.id);
-      if (!text) return;
+    let text = String(current?.text || '').trim();
+    if (!text && current?.audio?.available) text = await transcribe(chatId, current.id);
+    if (!text || !state.enabled) return;
 
-      const reply = await createReply(messages, text, chat);
-      const replyParts = splitReply(reply);
-      if (!replyParts.length || !state.enabled) return;
+    const reply = await createReply(messages, text, chat);
+    const replyParts = splitReply(reply);
+    if (!replyParts.length || !state.enabled) return;
 
-      await sleep(2200 + Math.floor(Math.random() * 2600));
+    if (latestIncomingId.get(chatId) !== current.id) {
+      scheduleChat(chat);
+      return;
+    }
+
+    await sleep(randomBetween(DELAY_MIN_MS, DELAY_MAX_MS));
+    if (!state.enabled || latestIncomingId.get(chatId) !== current.id) {
+      if (state.enabled) scheduleChat(chat);
+      return;
+    }
+
+    for (let index = 0; index < replyParts.length; index += 1) {
       if (!state.enabled) return;
-
-      for (let index = 0; index < replyParts.length; index += 1) {
-        if (!state.enabled) return;
-        await send(chatId, `${PREFIX}${replyParts[index]}`);
-        if (index < replyParts.length - 1) {
-          await sleep(650 + Math.floor(Math.random() * 850));
-        }
-      }
-
-      console.log(`[AutoReply] sent chat=${chatId} message=${current.id} parts=${replyParts.length}`);
-    } catch (error) {
-      console.warn(`[AutoReply] chat=${chatId} failed:`, error?.message || error);
-    } finally {
-      busy.delete(chatId);
+      await send(chatId, `${PREFIX}${replyParts[index]}`);
+      if (index < replyParts.length - 1) await sleep(randomBetween(INTERPART_MIN_MS, INTERPART_MAX_MS));
     }
+
+    console.log(`[AutoReply] sent chat=${chatId} message=${current.id} parts=${replyParts.length} total=${Math.round(performance.now() - eventStartedAt)}ms`);
   }
 
-  async function poll() {
+  function pumpQueue() {
     if (stopped) return;
-    try {
-      await checkControl();
-      if (state.enabled) {
-        const data = await bridge('/api/chats?limit=100');
-        for (const chat of data?.chats || []) {
-          if (!state.enabled) break;
-          await processChat(chat);
-        }
-      }
-    } catch (error) {
-      console.warn('[AutoReply] poll failed:', error?.message || error);
-    } finally {
-      if (!stopped) timer = setTimeout(() => void poll(), POLL_MS);
+    while (state.enabled && activeWorkers < CONCURRENCY && pendingChats.size) {
+      const [chatId, chat] = pendingChats.entries().next().value;
+      pendingChats.delete(chatId);
+      activeWorkers += 1;
+      void processChat(chat)
+        .catch(error => console.warn(`[AutoReply] chat=${chatId} failed:`, error?.message || error))
+        .finally(() => {
+          activeWorkers -= 1;
+          pumpQueue();
+        });
     }
   }
+
+  function enqueueChat(chat) {
+    const chatId = String(chat?.id || '');
+    if (!chatId || !state.enabled) return;
+    pendingChats.set(chatId, chat);
+    pumpQueue();
+  }
+
+  function scheduleChat(chat) {
+    const chatId = String(chat?.id || '');
+    if (!chatId || !state.enabled) return;
+    const existing = debounceTimers.get(chatId);
+    if (existing) clearTimeout(existing);
+    debounceTimers.set(chatId, setTimeout(() => {
+      debounceTimers.delete(chatId);
+      enqueueChat(chat);
+    }, DEBOUNCE_MS));
+  }
+
+  function onMessageEvent({ message, chat }) {
+    if (stopped || !initialized || !message?.id || !message?.chatId) return;
+
+    if (isControlChat(message.chatId)) {
+      void applyControlCommand(message).catch(error => console.warn('[AutoReply] control event failed:', error?.message || error));
+      return;
+    }
+
+    if (!state.enabled || message.fromMe || !isDirectChatJid(message.chatId)) return;
+    const cutoff = Math.max(startedAt, Number(state.enabledAt || 0));
+    if (Number(message.timestamp || 0) < cutoff) return;
+    latestIncomingId.set(message.chatId, message.id);
+    scheduleChat(chat || { id: message.chatId, timestamp: message.timestamp, name: message.pushName || null });
+  }
+
+  whatsappEvents.on('message', onMessageEvent);
 
   void (async () => {
     await loadState();
+    initialized = true;
     if (!CONTROL_JID) console.warn('[AutoReply] Configure AUTO_REPLY_CONTROL_JID (preferred) or AUTO_REPLY_CONTROL_NUMBER; automatic mode cannot be controlled until then.');
-    console.log(`[AutoReply] state=${state.enabled ? 'ON' : 'OFF'} model=${REPLY_MODEL} control=${CONTROL_JID ? 'configured' : 'missing'}`);
-    timer = setTimeout(() => void poll(), 1500);
+    console.log(`[AutoReply] state=${state.enabled ? 'ON' : 'OFF'} model=${REPLY_MODEL} control=${CONTROL_JID ? 'configured' : 'missing'} eventDriven=true concurrency=${CONCURRENCY} debounce=${DEBOUNCE_MS}ms delay=${DELAY_MIN_MS}-${DELAY_MAX_MS}ms`);
+    await checkControlFallback();
+    controlFallbackTimer = setInterval(() => void checkControlFallback(), CONTROL_FALLBACK_MS);
+    controlFallbackTimer.unref?.();
   })();
 
   return {
-    stop() { stopped = true; clearTimeout(timer); },
-    getState() { return { ...state, controlIdConfigured: Boolean(CONTROL_JID), model: REPLY_MODEL }; }
+    stop() {
+      stopped = true;
+      whatsappEvents.off('message', onMessageEvent);
+      if (controlFallbackTimer) clearInterval(controlFallbackTimer);
+      for (const timer of debounceTimers.values()) clearTimeout(timer);
+      debounceTimers.clear();
+      pendingChats.clear();
+    },
+    getState() {
+      return {
+        ...state,
+        controlIdConfigured: Boolean(CONTROL_JID),
+        model: REPLY_MODEL,
+        eventDriven: true,
+        concurrency: CONCURRENCY,
+        debounceMs: DEBOUNCE_MS,
+        delayMinMs: DELAY_MIN_MS,
+        delayMaxMs: DELAY_MAX_MS
+      };
+    }
   };
 }
