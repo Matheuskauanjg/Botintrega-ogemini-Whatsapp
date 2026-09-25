@@ -11,8 +11,23 @@ function normalizeNumber(value) {
   return digits;
 }
 
-function jidDigits(value) {
-  return String(value || '').split('@')[0].replace(/\D/g, '');
+function normalizeControlJid(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+
+  if (raw.includes('@')) {
+    const match = raw.match(/^([0-9]+)@(s\.whatsapp\.net|lid)$/i);
+    if (!match) return '';
+    return `${match[1]}@${match[2].toLowerCase()}`;
+  }
+
+  const number = normalizeNumber(raw);
+  return number ? `${number}@s.whatsapp.net` : '';
+}
+
+function isDirectChatJid(value) {
+  const jid = String(value || '').toLowerCase();
+  return jid.endsWith('@s.whatsapp.net') || jid.endsWith('@lid');
 }
 
 function normalizeCommand(value) {
@@ -34,8 +49,8 @@ function sleep(ms) {
 export function startAutoReplyService({ bridgePort, audioPort }) {
   const API_TOKEN = String(process.env.API_TOKEN || '').trim();
   const GROQ_API_KEY = String(process.env.GROQ_API_KEY || '').trim();
-  const CONTROL_NUMBER = normalizeNumber(process.env.AUTO_REPLY_CONTROL_NUMBER || '');
-  const CONTROL_JID = CONTROL_NUMBER ? `${CONTROL_NUMBER}@s.whatsapp.net` : '';
+  const CONTROL_INPUT = String(process.env.AUTO_REPLY_CONTROL_JID || process.env.AUTO_REPLY_CONTROL_NUMBER || '').trim();
+  const CONTROL_JID = normalizeControlJid(CONTROL_INPUT);
   const REPLY_MODEL = String(process.env.GROQ_REPLY_MODEL || DEFAULT_REPLY_MODEL).trim() || DEFAULT_REPLY_MODEL;
   const PREFIX = String(process.env.AUTO_REPLY_PREFIX ?? '🤖 ').slice(0, 30);
   const statePath = process.env.AUTO_REPLY_STATE_PATH || (String(process.env.BAILEYS_AUTH_PATH || '').startsWith('/var/data/')
@@ -90,7 +105,7 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
   }
 
   function isControlChat(jid) {
-    return Boolean(CONTROL_NUMBER) && jidDigits(jid) === CONTROL_NUMBER;
+    return Boolean(CONTROL_JID) && String(jid || '').toLowerCase() === CONTROL_JID.toLowerCase();
   }
 
   async function checkControl() {
@@ -108,16 +123,16 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
         processed.clear();
         lastChatTimestamp.clear();
         await saveState();
-        await send(CONTROL_NUMBER, '🤖 Respostas automáticas: ON');
+        await send(CONTROL_JID, '🤖 Respostas automáticas: ON');
         console.log('[AutoReply] ON');
       } else if (command === 'off') {
         state.enabled = false;
         await saveState();
-        await send(CONTROL_NUMBER, '🔕 Respostas automáticas: OFF');
+        await send(CONTROL_JID, '🔕 Respostas automáticas: OFF');
         console.log('[AutoReply] OFF');
       } else {
         await saveState();
-        await send(CONTROL_NUMBER, state.enabled ? '🤖 Respostas automáticas estão ON' : '🔕 Respostas automáticas estão OFF');
+        await send(CONTROL_JID, state.enabled ? '🤖 Respostas automáticas estão ON' : '🔕 Respostas automáticas estão OFF');
       }
     }
   }
@@ -159,7 +174,7 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
 
   async function processChat(chat) {
     const chatId = String(chat?.id || '');
-    if (!chatId.endsWith('@s.whatsapp.net') || isControlChat(chatId) || busy.has(chatId)) return;
+    if (!isDirectChatJid(chatId) || isControlChat(chatId) || busy.has(chatId)) return;
 
     const cutoff = Math.max(startedAt, Number(state.enabledAt || 0));
     const chatTimestamp = Number(chat?.timestamp || 0);
@@ -217,13 +232,13 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
 
   void (async () => {
     await loadState();
-    if (!CONTROL_NUMBER) console.warn('[AutoReply] AUTO_REPLY_CONTROL_NUMBER not configured; automatic mode cannot be controlled.');
-    console.log(`[AutoReply] state=${state.enabled ? 'ON' : 'OFF'} model=${REPLY_MODEL}`);
+    if (!CONTROL_JID) console.warn('[AutoReply] Configure AUTO_REPLY_CONTROL_JID (preferred) or AUTO_REPLY_CONTROL_NUMBER; automatic mode cannot be controlled until then.');
+    console.log(`[AutoReply] state=${state.enabled ? 'ON' : 'OFF'} model=${REPLY_MODEL} control=${CONTROL_JID ? 'configured' : 'missing'}`);
     timer = setTimeout(() => void poll(), 1500);
   })();
 
   return {
     stop() { stopped = true; clearTimeout(timer); },
-    getState() { return { ...state, controlNumberConfigured: Boolean(CONTROL_NUMBER), model: REPLY_MODEL }; }
+    getState() { return { ...state, controlIdConfigured: Boolean(CONTROL_JID), model: REPLY_MODEL }; }
   };
 }
