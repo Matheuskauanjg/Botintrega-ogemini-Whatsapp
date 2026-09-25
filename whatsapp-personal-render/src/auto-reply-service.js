@@ -47,6 +47,7 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
   let stopped = false;
   const processed = new Set();
   const busy = new Set();
+  const lastChatTimestamp = new Map();
   const startedAt = Math.floor(Date.now() / 1000);
 
   async function api(base, pathname, options = {}) {
@@ -104,6 +105,8 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
       if (command === 'on') {
         state.enabled = true;
         state.enabledAt = Math.floor(Date.now() / 1000);
+        processed.clear();
+        lastChatTimestamp.clear();
         await saveState();
         await send(CONTROL_NUMBER, '🤖 Respostas automáticas: ON');
         console.log('[AutoReply] ON');
@@ -157,9 +160,19 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
   async function processChat(chat) {
     const chatId = String(chat?.id || '');
     if (!chatId.endsWith('@s.whatsapp.net') || isControlChat(chatId) || busy.has(chatId)) return;
+
+    const cutoff = Math.max(startedAt, Number(state.enabledAt || 0));
+    const chatTimestamp = Number(chat?.timestamp || 0);
+    if (chatTimestamp && chatTimestamp < cutoff) {
+      lastChatTimestamp.set(chatId, chatTimestamp);
+      return;
+    }
+    if (chatTimestamp && lastChatTimestamp.get(chatId) === chatTimestamp) return;
+
     const data = await bridge(`/api/chats/${encodeURIComponent(chatId)}/messages?limit=16`);
     const messages = Array.isArray(data?.messages) ? data.messages : [];
-    const cutoff = Math.max(startedAt, Number(state.enabledAt || 0));
+    if (chatTimestamp) lastChatTimestamp.set(chatId, chatTimestamp);
+
     const incoming = messages.filter(message => message?.id && !message.fromMe && Number(message.timestamp || 0) >= cutoff && !processed.has(message.id));
     if (!incoming.length) return;
 
