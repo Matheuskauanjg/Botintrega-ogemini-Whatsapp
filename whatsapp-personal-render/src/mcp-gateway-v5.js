@@ -51,7 +51,6 @@ function verifyAccessToken(token, secret, expectedIssuer, expectedResource) {
   if (!token || !secret || !token.includes('.')) return null;
   const [body, signature] = token.split('.');
   if (!body || !signature || !safeEqual(signature, hmac(body, secret))) return null;
-
   try {
     const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
     if (!payload.exp || payload.exp <= Math.floor(Date.now() / 1000)) return null;
@@ -95,9 +94,7 @@ function hasScopes(payload, requiredScopes) {
 }
 
 function textResult(value) {
-  return {
-    content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }]
-  };
+  return { content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }] };
 }
 
 function audioResult(value) {
@@ -112,28 +109,31 @@ function audioResult(value) {
 }
 
 function errorResult(message) {
-  return {
-    content: [{ type: 'text', text: String(message) }],
-    isError: true
-  };
+  return { content: [{ type: 'text', text: String(message) }], isError: true };
 }
 
-export async function startMcpGateway({ publicPort, internalPort }) {
+export async function startMcpGateway({ publicPort, bridgePort, audioPort }) {
   const API_TOKEN = process.env.API_TOKEN || '';
   const LOGIN_SECRET = process.env.MCP_LOGIN_SECRET || API_TOKEN || process.env.QR_SECRET || '';
   const CLIENT_ID = process.env.MCP_CLIENT_ID || DEFAULT_CLIENT_ID;
-  const INTERNAL_BASE = `http://127.0.0.1:${internalPort}`;
+  const BRIDGE_BASE = `http://127.0.0.1:${bridgePort}`;
+  const AUDIO_BASE = `http://127.0.0.1:${audioPort}`;
 
-  async function internalJson(pathname, options = {}) {
-    if (!API_TOKEN) throw new Error('API_TOKEN is not configured on Render.');
+  async function internalJson(pathname, options = {}, target = 'bridge') {
+    if (!API_TOKEN) throw new Error('API_TOKEN is not configured.');
     const headers = new Headers(options.headers || {});
     headers.set('authorization', `Bearer ${API_TOKEN}`);
     if (options.body && !headers.has('content-type')) headers.set('content-type', 'application/json');
-    const response = await fetch(`${INTERNAL_BASE}${pathname}`, { ...options, headers });
+    const base = target === 'audio' ? AUDIO_BASE : BRIDGE_BASE;
+    const startedAt = performance.now();
+    const response = await fetch(`${base}${pathname}`, { ...options, headers });
     const text = await response.text();
     let data;
     try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
     if (!response.ok) throw new Error(data?.error || `Internal WhatsApp API returned HTTP ${response.status}`);
+    if (data && typeof data === 'object' && !Array.isArray(data) && data.internalGatewayLatencyMs == null) {
+      data.internalGatewayLatencyMs = Math.round(performance.now() - startedAt);
+    }
     return data;
   }
 
@@ -160,11 +160,11 @@ export async function startMcpGateway({ publicPort, internalPort }) {
   }
 
   function createWhatsappMcpServer() {
-    const server = new McpServer({ name: 'meu-whatsapp', version: '1.6.0' });
+    const server = new McpServer({ name: 'meu-whatsapp', version: '2.3.0' });
 
     server.registerTool('whatsapp_status', {
       title: 'Status do WhatsApp',
-      description: 'Verifica se o WhatsApp pessoal está conectado e pronto para uso.',
+      description: 'Verifica conexão, cache e armazenamento persistente do WhatsApp pessoal.',
       inputSchema: z.object({}),
       ...authDescriptor(['whatsapp.read']),
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
@@ -177,7 +177,7 @@ export async function startMcpGateway({ publicPort, internalPort }) {
 
     server.registerTool('list_whatsapp_chats', {
       title: 'Listar conversas do WhatsApp',
-      description: 'Lista conversas recentes armazenadas pelo bridge pessoal do WhatsApp.',
+      description: 'Lista conversas recentes, incluindo as persistidas no SQLite.',
       inputSchema: z.object({ limit: z.number().int().min(1).max(100).default(30) }),
       ...authDescriptor(['whatsapp.read']),
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
@@ -190,7 +190,7 @@ export async function startMcpGateway({ publicPort, internalPort }) {
 
     server.registerTool('read_whatsapp_messages', {
       title: 'Ler mensagens do WhatsApp',
-      description: 'Lê mensagens recentes em cache de uma conversa. Mensagens de áudio incluem metadados audio.available, mimetype, seconds e ptt.',
+      description: 'Lê mensagens persistidas de uma conversa. Retorna messageId em id; use esse id para reply, reação ou mencionar o autor.',
       inputSchema: z.object({
         chatId: z.string().min(1),
         limit: z.number().int().min(1).max(100).default(30)
@@ -206,10 +206,10 @@ export async function startMcpGateway({ publicPort, internalPort }) {
 
     server.registerTool('read_whatsapp_audio', {
       title: 'Ouvir áudio do WhatsApp',
-      description: 'Baixa uma mensagem de voz/áudio do WhatsApp e a retorna como conteúdo de áudio MCP. Use chatId e messageId obtidos em read_whatsapp_messages.',
+      description: 'Baixa e transcreve uma mensagem de voz recente. Use chatId e messageId obtidos em read_whatsapp_messages.',
       inputSchema: z.object({
-        chatId: z.string().min(1).describe('JID da conversa, por exemplo ...@s.whatsapp.net ou ...@g.us.'),
-        messageId: z.string().min(1).describe('ID da mensagem de áudio retornado por read_whatsapp_messages.')
+        chatId: z.string().min(1),
+        messageId: z.string().min(1)
       }),
       ...authDescriptor(['whatsapp.read']),
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
@@ -220,7 +220,7 @@ export async function startMcpGateway({ publicPort, internalPort }) {
         const data = await internalJson('/api/audio', {
           method: 'POST',
           body: JSON.stringify({ chatId, messageId })
-        });
+        }, 'audio');
         return audioResult(data);
       } catch (error) {
         return errorResult(error.message);
@@ -229,7 +229,7 @@ export async function startMcpGateway({ publicPort, internalPort }) {
 
     server.registerTool('search_whatsapp_messages', {
       title: 'Pesquisar mensagens do WhatsApp',
-      description: 'Pesquisa texto nas mensagens recentes armazenadas em cache pelo bridge.',
+      description: 'Pesquisa texto no histórico persistente SQLite do WhatsApp.',
       inputSchema: z.object({ query: z.string().min(1).max(500) }),
       ...authDescriptor(['whatsapp.read']),
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
@@ -240,20 +240,63 @@ export async function startMcpGateway({ publicPort, internalPort }) {
       catch (error) { return errorResult(error.message); }
     });
 
+    server.registerTool('whatsapp_storage_stats', {
+      title: 'Estatísticas do histórico do WhatsApp',
+      description: 'Mostra quantas conversas, mensagens e mapeamentos LID estão persistidos.',
+      inputSchema: z.object({}),
+      ...authDescriptor(['whatsapp.read']),
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+    }, async () => {
+      const denied = requireToolAuth(['whatsapp.read']);
+      if (denied) return denied;
+      try { return textResult(await internalJson('/api/db-stats')); }
+      catch (error) { return errorResult(error.message); }
+    });
+
     server.registerTool('send_whatsapp_message', {
-      title: 'Enviar mensagem no WhatsApp',
-      description: 'Envia uma única mensagem de texto pelo WhatsApp pessoal quando o usuário pedir explicitamente.',
+      title: 'Enviar ou responder mensagem no WhatsApp',
+      description: 'Envia texto. Pode responder/citar uma mensagem específica e mencionar usuários. Para responder e marcar o autor, use replyToMessageId e mentionAuthorOfMessageId com o mesmo id.',
       inputSchema: z.object({
-        to: z.string().min(1).describe('Número com DDI ou JID do WhatsApp.'),
-        message: z.string().min(1).max(5000)
+        to: z.string().min(1).describe('Número com DDI ou JID da conversa, inclusive @g.us e @lid.'),
+        message: z.string().min(1).max(5000),
+        replyToMessageId: z.string().min(1).optional().describe('ID da mensagem que deve aparecer citada na resposta.'),
+        mentionJids: z.array(z.string().min(1)).max(20).optional().describe('Números/JIDs a mencionar com @.'),
+        mentionAuthorOfMessageId: z.string().min(1).optional().describe('ID de uma mensagem cujo autor deve ser mencionado automaticamente.'),
+        prependMentions: z.boolean().optional().default(true).describe('Insere visualmente @numero no início para as menções.')
       }),
       ...authDescriptor(['whatsapp.send']),
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false }
-    }, async ({ to, message }) => {
+    }, async ({ to, message, replyToMessageId, mentionJids, mentionAuthorOfMessageId, prependMentions }) => {
       const denied = requireToolAuth(['whatsapp.send']);
       if (denied) return denied;
       try {
-        return textResult(await internalJson('/api/send', { method: 'POST', body: JSON.stringify({ to, message }) }));
+        return textResult(await internalJson('/api/send', {
+          method: 'POST',
+          body: JSON.stringify({ to, message, replyToMessageId, mentionJids, mentionAuthorOfMessageId, prependMentions })
+        }));
+      } catch (error) {
+        return errorResult(error.message);
+      }
+    });
+
+    server.registerTool('react_whatsapp_message', {
+      title: 'Reagir a uma mensagem do WhatsApp',
+      description: 'Adiciona uma reação por emoji a uma mensagem específica. Use emoji vazio para remover a reação.',
+      inputSchema: z.object({
+        to: z.string().min(1).describe('JID da conversa que contém a mensagem.'),
+        messageId: z.string().min(1).describe('ID retornado por read_whatsapp_messages.'),
+        emoji: z.string().max(20).default('')
+      }),
+      ...authDescriptor(['whatsapp.send']),
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false }
+    }, async ({ to, messageId, emoji }) => {
+      const denied = requireToolAuth(['whatsapp.send']);
+      if (denied) return denied;
+      try {
+        return textResult(await internalJson('/api/react', {
+          method: 'POST',
+          body: JSON.stringify({ to, messageId, emoji })
+        }));
       } catch (error) {
         return errorResult(error.message);
       }
@@ -261,24 +304,27 @@ export async function startMcpGateway({ publicPort, internalPort }) {
 
     server.registerTool('send_whatsapp_image', {
       title: 'Enviar imagem no WhatsApp',
-      description: 'Envia uma imagem para contato ou grupo. O bridge normaliza a imagem para JPEG compatível antes de enviar. Use URL pública ou base64/data URL.',
+      description: 'Envia imagem normalizada para JPEG; também pode citar uma mensagem e mencionar usuários.',
       inputSchema: z.object({
-        to: z.string().min(1).describe('Número com DDI ou JID do WhatsApp, incluindo grupos @g.us.'),
-        imageUrl: z.string().url().optional().describe('URL pública http/https da imagem.'),
-        imageBase64: z.string().optional().describe('Imagem em base64 puro ou data:image/...;base64,...'),
-        mimetype: z.string().optional().describe('Mantido por compatibilidade; a imagem será normalizada para JPEG.'),
-        caption: z.string().max(5000).optional().describe('Legenda opcional da imagem.')
+        to: z.string().min(1),
+        imageUrl: z.string().url().optional(),
+        imageBase64: z.string().optional(),
+        mimetype: z.string().optional(),
+        caption: z.string().max(5000).optional(),
+        replyToMessageId: z.string().min(1).optional(),
+        mentionJids: z.array(z.string().min(1)).max(20).optional(),
+        prependMentions: z.boolean().optional().default(true)
       }),
       ...authDescriptor(['whatsapp.send']),
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true }
-    }, async ({ to, imageUrl, imageBase64, mimetype, caption }) => {
+    }, async ({ to, imageUrl, imageBase64, mimetype, caption, replyToMessageId, mentionJids, prependMentions }) => {
       const denied = requireToolAuth(['whatsapp.send']);
       if (denied) return denied;
       if (!imageUrl && !imageBase64) return errorResult('imageUrl or imageBase64 is required');
       try {
         return textResult(await internalJson('/api/send-image', {
           method: 'POST',
-          body: JSON.stringify({ to, imageUrl, imageBase64, mimetype, caption })
+          body: JSON.stringify({ to, imageUrl, imageBase64, mimetype, caption, replyToMessageId, mentionJids, prependMentions })
         }));
       } catch (error) {
         return errorResult(error.message);
@@ -349,10 +395,10 @@ export async function startMcpGateway({ publicPort, internalPort }) {
       resource: expectedResource
     };
     const hiddenInputs = Object.entries(hidden)
-      .map(([key, value]) => `<input type=\"hidden\" name=\"${escapeHtml(key)}\" value=\"${escapeHtml(value)}\">`)
+      .map(([key, value]) => `<input type="hidden" name="${escapeHtml(key)}" value="${escapeHtml(value)}">`)
       .join('');
 
-    res.type('html').send(`<!doctype html><html lang=\"pt-BR\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Conectar Meu WhatsApp</title><style>body{font-family:Arial,sans-serif;background:#eef3f1;margin:0;min-height:100vh;display:grid;place-items:center;padding:24px}.card{max-width:460px;width:100%;background:#fff;padding:30px;border-radius:20px;box-shadow:0 10px 35px #0001}input{box-sizing:border-box;width:100%;padding:12px;margin:8px 0 16px;border:1px solid #ccd8d2;border-radius:10px;font-size:16px}button{width:100%;padding:12px;border:0;border-radius:10px;background:#1f8f55;color:#fff;font-size:16px;font-weight:700}.muted{color:#66766f;font-size:14px;line-height:1.5}</style></head><body><main class=\"card\"><h1>Conectar Meu WhatsApp</h1><p>Autorize o ChatGPT a acessar o seu WhatsApp pessoal.</p><form method=\"post\" action=\"/oauth/authorize\">${hiddenInputs}<label>Chave privada</label><input type=\"password\" name=\"access_key\" autocomplete=\"current-password\" required><button type=\"submit\">Autorizar ChatGPT</button></form><p class=\"muted\">Digite o valor de MCP_LOGIN_SECRET configurado no Render.</p></main></body></html>`);
+    res.type('html').send(`<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Conectar Meu WhatsApp</title><style>body{font-family:Arial,sans-serif;background:#eef3f1;margin:0;min-height:100vh;display:grid;place-items:center;padding:24px}.card{max-width:460px;width:100%;background:#fff;padding:30px;border-radius:20px;box-shadow:0 10px 35px #0001}input{box-sizing:border-box;width:100%;padding:12px;margin:8px 0 16px;border:1px solid #ccd8d2;border-radius:10px;font-size:16px}button{width:100%;padding:12px;border:0;border-radius:10px;background:#1f8f55;color:#fff;font-size:16px;font-weight:700}.muted{color:#66766f;font-size:14px;line-height:1.5}</style></head><body><main class="card"><h1>Conectar Meu WhatsApp</h1><p>Autorize o ChatGPT a acessar o seu WhatsApp pessoal.</p><form method="post" action="/oauth/authorize">${hiddenInputs}<label>Chave privada</label><input type="password" name="access_key" autocomplete="current-password" required><button type="submit">Autorizar ChatGPT</button></form><p class="muted">Digite o valor de MCP_LOGIN_SECRET configurado no serviço.</p></main></body></html>`);
   });
 
   app.post('/oauth/authorize', express.urlencoded({ extended: false, limit: '64kb' }), (req, res) => {
@@ -413,7 +459,7 @@ export async function startMcpGateway({ publicPort, internalPort }) {
   app.use('/mcp', (req, _res, next) => {
     const originalContentType = String(req.headers['content-type'] || '');
     const originalAccept = String(req.headers.accept || '');
-    console.log(`[MCP] inbound ${req.method} content-type=\"${originalContentType || '(none)'}\" accept=\"${originalAccept || '(none)'}\"`);
+    console.log(`[MCP] inbound ${req.method} content-type="${originalContentType || '(none)'}" accept="${originalAccept || '(none)'}"`);
     if (req.method === 'POST') {
       req.headers['content-type'] = 'application/json';
       const accepts = originalAccept.split(',').map(value => value.trim()).filter(Boolean);
@@ -446,7 +492,7 @@ export async function startMcpGateway({ publicPort, internalPort }) {
     const base = requestBaseUrl(req);
     res.json({
       name: 'Meu WhatsApp MCP',
-      version: '1.6.0',
+      version: '2.3.0',
       mcp: `${base}/mcp`,
       transport: 'streamable-http',
       authentication: 'oauth2-pkce-tool-level',
@@ -455,15 +501,26 @@ export async function startMcpGateway({ publicPort, internalPort }) {
       token: `${base}/oauth/token`,
       callback: STABLE_CHATGPT_REDIRECT,
       scopes: OAUTH_SCOPES,
-      tools: ['whatsapp_status', 'list_whatsapp_chats', 'read_whatsapp_messages', 'read_whatsapp_audio', 'search_whatsapp_messages', 'send_whatsapp_message', 'send_whatsapp_image']
+      tools: [
+        'whatsapp_status',
+        'list_whatsapp_chats',
+        'read_whatsapp_messages',
+        'read_whatsapp_audio',
+        'search_whatsapp_messages',
+        'whatsapp_storage_stats',
+        'send_whatsapp_message',
+        'react_whatsapp_message',
+        'send_whatsapp_image'
+      ]
     });
   });
 
   app.use((req, res) => {
-    const headers = { ...req.headers, host: `127.0.0.1:${internalPort}` };
+    const targetPort = req.path?.startsWith('/media/audio/') ? audioPort : bridgePort;
+    const headers = { ...req.headers, host: `127.0.0.1:${targetPort}` };
     delete headers['content-length'];
     delete headers.connection;
-    const upstream = http.request({ hostname: '127.0.0.1', port: internalPort, method: req.method, path: req.originalUrl, headers }, upstreamRes => {
+    const upstream = http.request({ hostname: '127.0.0.1', port: targetPort, method: req.method, path: req.originalUrl, headers }, upstreamRes => {
       res.status(upstreamRes.statusCode || 502);
       for (const [key, value] of Object.entries(upstreamRes.headers)) if (value !== undefined) res.setHeader(key, value);
       upstreamRes.pipe(res);
@@ -478,10 +535,11 @@ export async function startMcpGateway({ publicPort, internalPort }) {
 
   const publicServer = app.listen(publicPort, '0.0.0.0', () => {
     console.log(`[Gateway] Public HTTP/MCP listening on 0.0.0.0:${publicPort}`);
-    console.log('[MCP] Endpoint: /mcp (Streamable HTTP + media v2 + tool-level OAuth)');
+    console.log('[MCP] Endpoint: /mcp (Streamable HTTP + persistent history + replies/mentions/reactions)');
     console.log(`[OAuth] Client ID: ${CLIENT_ID}`);
     console.log(`[OAuth] Callback: ${STABLE_CHATGPT_REDIRECT}`);
-    console.log(`[Gateway] Internal WhatsApp bridge: ${INTERNAL_BASE}`);
+    console.log(`[Gateway] Direct bridge: ${BRIDGE_BASE}`);
+    console.log(`[Gateway] Audio proxy: ${AUDIO_BASE}`);
   });
 
   const cleanup = async () => {
