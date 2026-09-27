@@ -38,6 +38,11 @@ let whatsappState = 'starting';
 let lastError = null;
 let latestQrDataUrl = null;
 let latestQrAt = null;
+let latestPairingCode = null;
+let latestPairingAt = null;
+let latestPairingPhoneLast4 = null;
+let pairingModeActive = false;
+let authRegistered = false;
 let me = null;
 let reconnectTimer = null;
 let socketGeneration = 0;
@@ -214,6 +219,27 @@ function jidFromDestination(value) {
   return `${digits}@s.whatsapp.net`;
 }
 
+function normalizePairingPhone(value) {
+  let digits = String(value || '').replace(/\D/g, '');
+  if (!digits) return null;
+  if ((digits.length === 10 || digits.length === 11) && !digits.startsWith('55')) digits = `55${digits}`;
+  if (digits.length < 10 || digits.length > 15) return null;
+  return digits;
+}
+
+function formatPairingCode(value) {
+  const code = String(value || '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+  if (code.length === 8) return `${code.slice(0, 4)}-${code.slice(4)}`;
+  return code;
+}
+
+function clearPairingState() {
+  latestPairingCode = null;
+  latestPairingAt = null;
+  latestPairingPhoneLast4 = null;
+  pairingModeActive = false;
+}
+
 function isPrivateHostname(hostname) {
   const host = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
   if (!host) return true;
@@ -312,7 +338,9 @@ async function clearInvalidSession() {
   try {
     await fs.rm(AUTH_PATH, { recursive: true, force: true });
     await fs.mkdir(AUTH_PATH, { recursive: true });
-    console.log('[Baileys] Sessão inválida removida; novo QR será solicitado.');
+    authRegistered = false;
+    clearPairingState();
+    console.log('[Baileys] Sessão inválida removida; novo QR/código será solicitado.');
   } catch (error) {
     console.error('[Baileys] Falha ao limpar sessão:', error);
   }
@@ -324,10 +352,12 @@ async function connectWhatsApp() {
   lastError = null;
   await fs.mkdir(AUTH_PATH, { recursive: true });
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_PATH);
+  authRegistered = Boolean(state.creds?.registered);
 
   const currentSock = makeWASocket({
     auth: state,
     logger,
+    printQRInTerminal: false,
     markOnlineOnConnect: false,
     emitOwnEvents: true,
     syncFullHistory: true,
@@ -336,7 +366,10 @@ async function connectWhatsApp() {
 
   sock = currentSock;
   console.log(`[Baileys] Socket iniciado. Auth: ${AUTH_PATH}`);
-  currentSock.ev.on('creds.update', saveCreds);
+  currentSock.ev.on('creds.update', async () => {
+    authRegistered = Boolean(state.creds?.registered);
+    await saveCreds();
+  });
 
   currentSock.ev.on('messaging-history.set', ({ chats: historyChats, contacts: historyContacts, messages, lidPnMappings }) => {
     for (const chat of historyChats || []) upsertChat(chat);
@@ -373,7 +406,7 @@ async function connectWhatsApp() {
       try {
         latestQrDataUrl = await QRCode.toDataURL(qr, { width: 560, margin: 3, errorCorrectionLevel: 'M' });
         latestQrAt = new Date().toISOString();
-        whatsappState = 'waiting_for_qr_scan';
+        if (!pairingModeActive) whatsappState = 'waiting_for_qr_scan';
         lastError = null;
         console.log('[Baileys] QR gráfico pronto em /qr');
       } catch (error) {
@@ -382,11 +415,13 @@ async function connectWhatsApp() {
       }
     }
 
-    if (connection === 'connecting' && !qr && whatsappState !== 'waiting_for_qr_scan') whatsappState = 'connecting';
+    if (connection === 'connecting' && !qr && whatsappState !== 'waiting_for_qr_scan' && whatsappState !== 'waiting_for_pairing_code') whatsappState = 'connecting';
 
     if (connection === 'open') {
       latestQrDataUrl = null;
       latestQrAt = null;
+      clearPairingState();
+      authRegistered = true;
       whatsappState = 'ready';
       lastError = null;
       me = currentSock.user ? { id: currentSock.user.id || null, name: currentSock.user.name || null } : null;
@@ -405,6 +440,8 @@ async function connectWhatsApp() {
       console.warn(`[Baileys] Conexão fechada. status=${statusCode ?? 'unknown'} loggedOut=${loggedOut}`);
 
       if (loggedOut) {
+        authRegistered = false;
+        clearPairingState();
         whatsappState = 'logged_out';
         lastError = 'Sessão desconectada do WhatsApp. Gerando uma nova sessão.';
         await clearInvalidSession();
@@ -439,20 +476,160 @@ function withVisibleMentionPrefix(message, mentions, enabled = true) {
 }
 
 app.get('/', (_req, res) => {
-  res.type('html').send(`<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WhatsApp Personal Bridge</title></head><body style="font-family:Arial,sans-serif;max-width:760px;margin:40px auto;padding:0 20px"><h1>WhatsApp Personal Bridge · Media v2</h1><p>Status: <strong>${whatsappState}</strong></p><p><a href="/qr">Abrir QR Code</a></p></body></html>`);
+  res.type('html').send(`<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WhatsApp Personal Bridge</title></head><body style="font-family:Arial,sans-serif;max-width:760px;margin:40px auto;padding:0 20px"><h1>WhatsApp Personal Bridge · Media v2</h1><p>Status: <strong>${whatsappState}</strong></p><p><a href="/qr">Conectar WhatsApp por QR Code ou código</a></p></body></html>`);
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'whatsapp-personal-render-media-v2', whatsappState, ready: isReady(), hasQr: Boolean(latestQrDataUrl), qrGeneratedAt: latestQrAt, cachedChats: chats.size, authPath: AUTH_PATH, database: persistentStore.stats(), lastError });
+  res.json({
+    ok: true,
+    service: 'whatsapp-personal-render-media-v2',
+    whatsappState,
+    ready: isReady(),
+    hasQr: Boolean(latestQrDataUrl),
+    qrGeneratedAt: latestQrAt,
+    pairingMode: pairingModeActive,
+    pairingCodeGeneratedAt: latestPairingAt,
+    cachedChats: chats.size,
+    authPath: AUTH_PATH,
+    database: persistentStore.stats(),
+    lastError
+  });
 });
 
 app.get('/qr', (req, res) => {
   if (QR_SECRET && req.query.key !== QR_SECRET) return res.status(401).type('html').send('<h1>401 - chave do QR inválida</h1>');
+
+  const keySuffix = req.query.key ? `?key=${encodeURIComponent(String(req.query.key))}` : '';
+  const pairingInfo = latestPairingCode
+    ? `<div class="pairing-result"><div class="pairing-label">Código para inserir no WhatsApp</div><div class="pairing-code">${latestPairingCode}</div><p>Abra o WhatsApp no celular → Dispositivos conectados → Conectar dispositivo → <strong>Conectar com número de telefone</strong> e digite este código.</p>${latestPairingPhoneLast4 ? `<p class="muted">Número final: ••••${latestPairingPhoneLast4}</p>` : ''}</div>`
+    : '';
+
   let content;
-  if (latestQrDataUrl) content = `<img src="${latestQrDataUrl}" alt="QR Code" style="width:min(560px,100%)"><p>WhatsApp → Dispositivos conectados → Conectar dispositivo.</p>`;
-  else if (whatsappState === 'ready') content = '<h2>✓ WhatsApp conectado</h2>';
-  else content = `<h2>Gerando QR...</h2><p>${whatsappState}</p>`;
-  res.type('html').send(`<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta http-equiv="refresh" content="4"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Conectar WhatsApp</title></head><body style="font-family:Arial,sans-serif;max-width:680px;margin:40px auto;text-align:center">${content}</body></html>`);
+  if (whatsappState === 'ready') {
+    content = '<div class="connected"><div class="check">✓</div><h2>WhatsApp conectado</h2><p>A sessão está pronta para uso pelo MeuWhats.</p></div>';
+  } else {
+    const qrBlock = latestQrDataUrl
+      ? `<img src="${latestQrDataUrl}" alt="QR Code do WhatsApp" class="qr"><p>WhatsApp → Dispositivos conectados → Conectar dispositivo e leia o QR Code.</p>`
+      : `<div class="spinner"></div><h3>Gerando QR Code...</h3><p class="muted">Estado: ${whatsappState}</p>`;
+
+    content = `
+      <div class="methods">
+        <section class="method">
+          <div class="method-number">1</div>
+          <h2>Conectar por QR Code</h2>
+          ${qrBlock}
+        </section>
+        <div class="or"><span>ou</span></div>
+        <section class="method">
+          <div class="method-number">2</div>
+          <h2>Conectar com código</h2>
+          <p>Use esta opção quando estiver no celular e não puder escanear o QR.</p>
+          <form id="pairing-form" class="pairing-form">
+            <label for="phone">Seu número do WhatsApp</label>
+            <input id="phone" name="phone" inputmode="tel" autocomplete="tel" placeholder="+55 41 99999-9999" required>
+            <button type="submit">Gerar código</button>
+          </form>
+          <div id="pairing-message" class="message" aria-live="polite"></div>
+          ${pairingInfo}
+        </section>
+      </div>`;
+  }
+
+  res.type('html').send(`<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Conectar WhatsApp</title>
+<style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:#0b141a;color:#e9edef;font-family:Inter,Arial,sans-serif;padding:24px}.page{width:min(980px,100%);margin:0 auto}.hero{text-align:center;margin:12px 0 24px}.hero h1{font-size:clamp(28px,5vw,42px);margin:0 0 8px}.hero p{color:#aebac1;margin:0}.card{background:#111b21;border:1px solid #22313a;border-radius:24px;padding:clamp(18px,4vw,32px);box-shadow:0 18px 60px rgba(0,0,0,.28)}.methods{display:grid;grid-template-columns:1fr auto 1fr;gap:24px;align-items:start}.method{text-align:center;min-width:0}.method h2{font-size:22px;margin:6px 0 10px}.method p{color:#aebac1;line-height:1.55}.method-number{width:34px;height:34px;border-radius:50%;display:grid;place-items:center;margin:0 auto 8px;background:#00a884;color:#071b16;font-weight:800}.or{align-self:center;color:#8696a0}.or span{display:grid;place-items:center;width:42px;height:42px;border-radius:50%;background:#202c33;font-size:13px;font-weight:700}.qr{display:block;width:min(390px,100%);height:auto;margin:18px auto;background:#fff;border-radius:16px;padding:10px}.pairing-form{display:grid;gap:10px;margin:20px auto 10px;max-width:390px;text-align:left}.pairing-form label{font-size:13px;color:#c7d0d5}.pairing-form input{width:100%;border:1px solid #3b4a54;background:#202c33;color:#fff;border-radius:12px;padding:14px 15px;font-size:16px;outline:none}.pairing-form input:focus{border-color:#00a884}.pairing-form button,.reset button{border:0;border-radius:999px;padding:13px 18px;background:#00a884;color:#071b16;font-weight:800;font-size:15px;cursor:pointer}.pairing-form button:disabled{opacity:.6;cursor:wait}.pairing-result{margin:18px auto 0;max-width:440px;padding:18px;background:#0d2f29;border:1px solid #1e5d50;border-radius:16px}.pairing-label{font-size:13px;color:#aebac1}.pairing-code{font-size:clamp(32px,8vw,50px);font-weight:900;letter-spacing:.1em;margin:8px 0 12px;color:#25d366;word-break:break-word}.message{min-height:22px;color:#f5c26b;font-size:14px}.muted{color:#8696a0!important;font-size:13px}.connected{text-align:center;padding:30px}.check{width:82px;height:82px;border-radius:50%;display:grid;place-items:center;margin:0 auto 16px;background:#0d5c47;color:#25d366;font-size:48px;font-weight:900}.spinner{width:48px;height:48px;border:5px solid #273942;border-top-color:#25d366;border-radius:50%;margin:26px auto;animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.state{text-align:center;margin-top:18px;color:#8696a0;font-size:13px}.reset{text-align:center;margin-top:18px}.reset button{background:#202c33;color:#e9edef;border:1px solid #3b4a54}.error{color:#ff8a8a}@media(max-width:760px){.methods{grid-template-columns:1fr}.or{justify-self:center}.card{border-radius:18px}.qr{width:min(340px,100%)}}
+</style>
+</head>
+<body>
+<main class="page">
+  <div class="hero"><h1>Conectar WhatsApp</h1><p>Escolha QR Code ou código pelo número de telefone.</p></div>
+  <div class="card">${content}<div class="state">Estado: <strong>${whatsappState}</strong>${lastError ? `<br><span class="error">${String(lastError).replace(/[<>&]/g, '')}</span>` : ''}</div></div>
+  ${whatsappState !== 'ready' ? `<form class="reset" method="post" action="/qr/reset${keySuffix}"><button type="submit">Gerar nova sessão</button></form>` : ''}
+</main>
+<script>
+(() => {
+  const form = document.getElementById('pairing-form');
+  const message = document.getElementById('pairing-message');
+  if (!form || !message) return;
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const phone = String(new FormData(form).get('phone') || '').trim();
+    const button = form.querySelector('button');
+    button.disabled = true;
+    message.className = 'message';
+    message.textContent = 'Gerando código...';
+    try {
+      const response = await fetch('/pairing-code${keySuffix}', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ phone })
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || 'Não foi possível gerar o código.');
+      message.textContent = 'Código gerado. Atualizando a tela...';
+      window.setTimeout(() => window.location.reload(), 250);
+    } catch (error) {
+      message.className = 'message error';
+      message.textContent = error.message || 'Falha ao gerar o código.';
+      button.disabled = false;
+    }
+  });
+})();
+</script>
+${whatsappState !== 'ready' && !latestPairingCode ? '<script>setTimeout(() => location.reload(), 5000)</script>' : ''}
+</body></html>`);
+});
+
+app.post('/pairing-code', requireQrSecret, async (req, res) => {
+  try {
+    if (isReady()) return res.status(409).json({ error: 'O WhatsApp já está conectado.' });
+    if (!sock || typeof sock.requestPairingCode !== 'function') {
+      return res.status(503).json({ error: 'O conector ainda está iniciando. Aguarde alguns segundos e tente novamente.' });
+    }
+    if (authRegistered) {
+      return res.status(409).json({ error: 'Esta sessão já possui credenciais. Use “Gerar nova sessão” antes de vincular outro número.' });
+    }
+    if (!latestQrAt && whatsappState !== 'waiting_for_qr_scan') {
+      return res.status(409).json({ error: 'Aguarde o QR Code aparecer antes de solicitar o código pelo telefone.' });
+    }
+
+    const phone = normalizePairingPhone(req.body?.phone);
+    if (!phone) return res.status(400).json({ error: 'Informe um número válido com DDI. Ex.: +55 41 99999-9999.' });
+
+    pairingModeActive = true;
+    latestPairingCode = null;
+    latestPairingAt = null;
+    latestPairingPhoneLast4 = phone.slice(-4);
+    whatsappState = 'generating_pairing_code';
+    lastError = null;
+
+    const code = await sock.requestPairingCode(phone);
+    latestPairingCode = formatPairingCode(code);
+    latestPairingAt = new Date().toISOString();
+    whatsappState = 'waiting_for_pairing_code';
+    console.log(`[Baileys] Código de pareamento gerado para final ${latestPairingPhoneLast4}.`);
+
+    res.json({
+      ok: true,
+      code: latestPairingCode,
+      generatedAt: latestPairingAt,
+      phoneLast4: latestPairingPhoneLast4,
+      state: whatsappState
+    });
+  } catch (error) {
+    pairingModeActive = false;
+    latestPairingCode = null;
+    latestPairingAt = null;
+    whatsappState = latestQrDataUrl ? 'waiting_for_qr_scan' : 'pairing_code_error';
+    lastError = error?.message || 'Falha ao gerar código de pareamento';
+    console.error('[Baileys] Erro ao gerar código de pareamento:', error);
+    res.status(500).json({ error: lastError });
+  }
 });
 
 app.post('/qr/reset', requireQrSecret, async (_req, res) => {
@@ -462,6 +639,8 @@ app.post('/qr/reset', requireQrSecret, async (_req, res) => {
     sock = null;
     latestQrDataUrl = null;
     latestQrAt = null;
+    clearPairingState();
+    authRegistered = false;
     me = null;
     whatsappState = 'resetting';
     await clearInvalidSession();
@@ -473,7 +652,17 @@ app.post('/qr/reset', requireQrSecret, async (_req, res) => {
 });
 
 app.get('/api/status', requireApiToken, (_req, res) => {
-  res.json({ state: whatsappState, ready: isReady(), me, cachedChats: chats.size, authPath: AUTH_PATH, database: persistentStore.stats(), lastError });
+  res.json({
+    state: whatsappState,
+    ready: isReady(),
+    me,
+    cachedChats: chats.size,
+    authPath: AUTH_PATH,
+    database: persistentStore.stats(),
+    pairingMode: pairingModeActive,
+    pairingCodeGeneratedAt: latestPairingAt,
+    lastError
+  });
 });
 
 app.get('/api/chats', requireApiToken, (req, res) => {
