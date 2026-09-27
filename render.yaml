@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: whatsapp-personal-bridge
+    runtime: docker
+    dockerfilePath: ./whatsapp-personal-render/Dockerfile
+    dockerContext: ./whatsapp-personal-render
+    plan: starter
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: API_TOKEN
+        sync: false
+      - key: QR_SECRET
+        sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: TUNNEL_TOKEN
+        sync: false
+      - key: BAILEYS_AUTH_PATH
+        value: /var/data/baileys_auth
+      - key: BAILEYS_LOG_LEVEL
+        value: silent
+    disk:
+      name: whatsapp-session
+      mountPath: /var/data
+      sizeGB: 1
