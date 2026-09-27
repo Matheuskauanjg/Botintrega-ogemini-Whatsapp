@@ -75,8 +75,6 @@ function splitReply(value) {
   const text = cleanReply(value);
   if (!text) return [];
 
-  // Matheus costuma mandar várias mensagens curtas, mas quando precisa se defender,
-  // justificar ou explicar algo importante, um texto longo deve permanecer inteiro.
   if (text.length >= 650) return [text];
 
   const parts = text
@@ -102,6 +100,21 @@ function getSaoPauloParts(date = new Date()) {
     hourCycle: 'h23'
   }).formatToParts(date);
   return Object.fromEntries(parts.filter(p => p.type !== 'literal').map(p => [p.type, p.value]));
+}
+
+function localIsoLike(date = new Date()) {
+  const p = getSaoPauloParts(date);
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:00-03:00`;
+}
+
+function localDayEndTimestamp() {
+  const p = getSaoPauloParts();
+  return new Date(`${p.year}-${p.month}-${p.day}T23:59:59-03:00`).getTime();
+}
+
+function localDayStartSeconds() {
+  const p = getSaoPauloParts();
+  return Math.floor(new Date(`${p.year}-${p.month}-${p.day}T00:00:00-03:00`).getTime() / 1000);
 }
 
 function formatLocalDateTime(timestamp) {
@@ -155,6 +168,15 @@ function parseScheduleDate(dateText, timeText) {
   return parsed.getTime();
 }
 
+function extractJsonObject(value) {
+  const text = String(value || '').trim();
+  if (!text) return null;
+  try { return JSON.parse(text); } catch {}
+  const match = text.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  try { return JSON.parse(match[0]); } catch { return null; }
+}
+
 function parseControlAction(value) {
   const raw = String(value || '').trim();
   if (!raw) return null;
@@ -168,6 +190,11 @@ function parseControlAction(value) {
   if (['agenda', 'agendados', 'ver agenda'].includes(normalized)) return { type: 'list_schedule' };
   if (['limpar ordens', 'apagar ordens'].includes(normalized)) return { type: 'clear_orders' };
   if (['limpar recados', 'limpar notas', 'apagar recados', 'apagar notas'].includes(normalized)) return { type: 'clear_notes' };
+  if (['retomar automatico', 'retomar automático', 'continuar automatico', 'continuar automático'].includes(normalized)) return { type: 'resume' };
+  if (['sem resposta hoje', 'quem ficou sem resposta hoje', 'me mostra quem ficou sem resposta hoje'].includes(normalized)) return { type: 'list_unanswered_today' };
+
+  const pauseMatch = normalized.match(/^(?:pausa|pause|pausar)(?: o)? automatico por (\d+)\s*(min|minutos?|h|hora|horas)$/i);
+  if (pauseMatch) return { type: 'pause', amount: Number(pauseMatch[1]), unit: pauseMatch[2] };
 
   const cancelMatch = normalized.match(/^(?:cancelar|apagar agendamento)\s+#?([a-z0-9-]+)$/i);
   if (cancelMatch) return { type: 'cancel_schedule', id: cancelMatch[1].toUpperCase() };
@@ -178,7 +205,6 @@ function parseControlAction(value) {
   const noteMatch = raw.match(/^(?:recado|nota|contexto)\s*:\s*(.+)$/is);
   if (noteMatch) return { type: 'add_note', text: noteMatch[1].trim() };
 
-  // agendar +5541999999999 amanhã 15:30 | mensagem
   const scheduleMatch = raw.match(/^agendar\s+(\S+)\s+(hoje|amanh[ãa]|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)\s+(\d{1,2}:\d{2})\s*\|\s*(.+)$/is);
   if (scheduleMatch) {
     return {
@@ -190,7 +216,6 @@ function parseControlAction(value) {
     };
   }
 
-  // agendar +5541999999999 15:30 | mensagem  (hoje; se já passou, amanhã)
   const shortScheduleMatch = raw.match(/^agendar\s+(\S+)\s+(\d{1,2}:\d{2})\s*\|\s*(.+)$/is);
   if (shortScheduleMatch) {
     return {
@@ -201,7 +226,6 @@ function parseControlAction(value) {
     };
   }
 
-  // agendar em 10 min +5541999999999 | mensagem
   const relativeScheduleMatch = raw.match(/^agendar\s+em\s+(\d+)\s*(min|minutos?|h|hora|horas)\s+(\S+)\s*\|\s*(.+)$/is);
   if (relativeScheduleMatch) {
     return {
@@ -227,6 +251,7 @@ function buildMatheusStylePrompt(contactName, extraStyle = '') {
     'Use principalmente as mensagens anteriores com role assistant como exemplos reais do jeito que Matheus escreve com esse contato.',
     'Jeito padrão do Matheus em conversa casual: curto, direto, informal, geralmente em minúsculas, sem português excessivamente polido.',
     'Matheus normalmente manda várias mensagens curtas em sequência em vez de um bloco único.',
+    'Quando a outra pessoa mandar várias mensagens seguidas, entenda o conjunto como uma única fala antes de responder.',
     'Use kkk/kkkk com moderação. Não coloque risada em toda resposta; só quando o contexto realmente tiver humor, ironia ou zoeira.',
     'Quando Matheus precisa se defender, justificar uma atitude, esclarecer um mal-entendido ou rebater uma acusação, ele pode escrever um texto longo, detalhado e contínuo. Não force respostas curtas nesses casos.',
     'Adapte o tom ao contato: em trabalho/comercial seja simples, educado e objetivo; com amigos pode ser mais solto e zoeiro; em conversa afetiva acompanhe o nível de carinho que já existe no histórico.',
@@ -257,7 +282,7 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
   const EXTRA_STYLE = String(process.env.AUTO_REPLY_STYLE || '').trim().slice(0, 3000);
   const DELAY_MIN_MS = clampNumber(process.env.AUTO_REPLY_DELAY_MIN_MS, 250, 0, 10000);
   const DELAY_MAX_MS = Math.max(DELAY_MIN_MS, clampNumber(process.env.AUTO_REPLY_DELAY_MAX_MS, 750, 0, 15000));
-  const DEBOUNCE_MS = clampNumber(process.env.AUTO_REPLY_DEBOUNCE_MS, 350, 50, 5000);
+  const DEBOUNCE_MS = clampNumber(process.env.AUTO_REPLY_DEBOUNCE_MS, 4000, 500, 12000);
   const CONCURRENCY = Math.round(clampNumber(process.env.AUTO_REPLY_CONCURRENCY, 4, 1, 12));
   const INTERPART_MIN_MS = clampNumber(process.env.AUTO_REPLY_INTERPART_MIN_MS, 150, 0, 5000);
   const INTERPART_MAX_MS = Math.max(INTERPART_MIN_MS, clampNumber(process.env.AUTO_REPLY_INTERPART_MAX_MS, 350, 0, 7000));
@@ -273,9 +298,12 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
   let state = {
     enabled: false,
     enabledAt: 0,
+    pauseUntil: 0,
     lastControlMessageId: null,
     orders: [],
     notes: [],
+    watchers: [],
+    nextWatcherId: 1,
     scheduled: [],
     nextScheduleId: 1
   };
@@ -333,17 +361,23 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
       state = {
         enabled: Boolean(saved?.enabled),
         enabledAt: Number(saved?.enabledAt || 0),
+        pauseUntil: Number(saved?.pauseUntil || 0),
         lastControlMessageId: saved?.lastControlMessageId || null,
-        orders: Array.isArray(saved?.orders) ? saved.orders.slice(-30) : [],
+        orders: Array.isArray(saved?.orders) ? saved.orders.slice(-50) : [],
         notes: Array.isArray(saved?.notes) ? saved.notes.slice(-50) : [],
+        watchers: Array.isArray(saved?.watchers) ? saved.watchers.slice(-50) : [],
+        nextWatcherId: Math.max(1, Number(saved?.nextWatcherId || 1)),
         scheduled: Array.isArray(saved?.scheduled) ? saved.scheduled.slice(-100) : [],
         nextScheduleId: Math.max(1, Number(saved?.nextScheduleId || 1))
       };
     } catch {}
+    state.orders = state.orders.filter(item => !item?.expiresAt || Number(item.expiresAt) > Date.now());
+    if (state.pauseUntil && state.pauseUntil <= Date.now()) state.pauseUntil = 0;
   }
 
   async function saveState() {
     try {
+      state.orders = state.orders.filter(item => !item?.expiresAt || Number(item.expiresAt) > Date.now());
       await fs.mkdir(path.dirname(statePath), { recursive: true });
       await fs.writeFile(statePath, JSON.stringify({ ...state, updatedAt: new Date().toISOString() }, null, 2), 'utf8');
     } catch (error) {
@@ -359,39 +393,72 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
     return Boolean(CONTROL_JID) && String(jid || '').toLowerCase() === CONTROL_JID.toLowerCase();
   }
 
+  function isPaused() {
+    if (!state.pauseUntil) return false;
+    if (state.pauseUntil <= Date.now()) {
+      state.pauseUntil = 0;
+      void saveState();
+      return false;
+    }
+    return true;
+  }
+
   function getRuntimeInstructions() {
     const sections = [];
     if (EXTRA_STYLE) sections.push(`ESTILO FIXO:\n${EXTRA_STYLE}`);
-    if (state.orders.length) {
-      sections.push(`ORDENS ATUAIS DO MATHEUS (devem ser seguidas enquanto existirem):\n${state.orders.map((item, i) => `${i + 1}. ${item.text}`).join('\n')}`);
+    const activeOrders = state.orders.filter(item => !item?.expiresAt || Number(item.expiresAt) > Date.now());
+    if (activeOrders.length) {
+      sections.push(`ORDENS ATUAIS DO MATHEUS (devem ser seguidas enquanto existirem):\n${activeOrders.map((item, i) => `${i + 1}. ${item.text}`).join('\n')}`);
     }
     if (state.notes.length) {
       sections.push(`RECADOS/CONTEXTO DEIXADOS PELO MATHEUS:\n${state.notes.slice(-20).map((item, i) => `${i + 1}. ${item.text}`).join('\n')}`);
     }
-    return sections.join('\n\n').slice(0, 7000);
+    return sections.join('\n\n').slice(0, 8000);
   }
 
   function controlHelp() {
     return [
       '🤖 Central da IA',
       '',
+      'Pode falar comigo normalmente. Exemplos:',
+      '“responde o Davi se ele mandar mensagem”',
+      '“se minha mãe perguntar onde tô fala que tô trabalhando”',
+      '“amanhã 8h manda bom dia pra Davi”',
+      '“quando Jhenny chegar em casa me avisa”',
+      '“me mostra quem ficou sem resposta hoje”',
+      '“pausa o automático por 1 hora”',
+      '“não responda grupos hoje”',
+      '',
+      'Comandos rápidos também continuam:',
       'auto on / auto off / auto status',
-      'ordem: <instrução permanente>',
-      'recado: <contexto para a IA lembrar>',
+      'ordem: <instrução>',
+      'recado: <contexto>',
       'ordens / recados / limpar ordens / limpar recados',
-      '',
-      'Agendar mensagem:',
-      'agendar +5541999999999 amanhã 15:30 | mensagem',
-      'agendar +5541999999999 15:30 | mensagem',
-      'agendar em 10 min +5541999999999 | mensagem',
-      '',
-      'agenda / cancelar A1',
-      '',
-      'Também pode usar "ia:" no lugar de "ordem:".'
+      'agenda / cancelar A1'
     ].join('\n');
   }
 
-  function addScheduled(target, dueAt, message) {
+  async function resolveTarget(target) {
+    const raw = String(target || '').trim();
+    if (!raw) return null;
+    if (raw.includes('@')) return { id: raw, name: raw };
+    const digits = raw.replace(/\D/g, '');
+    if (digits.length >= 10) return { id: raw, name: raw };
+
+    const data = await bridge('/api/chats?limit=100');
+    const chats = Array.isArray(data?.chats) ? data.chats : [];
+    const query = normalizeCommand(raw);
+    const candidates = chats
+      .filter(chat => chat?.id && !isControlChat(chat.id))
+      .map(chat => ({ ...chat, normalizedName: normalizeCommand(chat.name || '') }))
+      .filter(chat => chat.normalizedName && (chat.normalizedName === query || chat.normalizedName.includes(query) || query.includes(chat.normalizedName)));
+
+    const exact = candidates.find(chat => chat.normalizedName === query);
+    const chosen = exact || (candidates.length === 1 ? candidates[0] : null);
+    return chosen ? { id: chosen.id, name: chosen.name || raw } : null;
+  }
+
+  function addScheduled(target, dueAt, message, displayName = null) {
     const cleanTarget = String(target || '').trim();
     const cleanMessage = String(message || '').trim();
     if (!cleanTarget || !cleanMessage || !Number.isFinite(dueAt)) throw new Error('agendamento inválido');
@@ -399,6 +466,7 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
     const job = {
       id,
       target: cleanTarget,
+      displayName: displayName || null,
       message: cleanMessage.slice(0, 5000),
       dueAt,
       status: 'pending',
@@ -410,16 +478,155 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
     return job;
   }
 
+  async function interpretNaturalControl(text) {
+    const raw = String(text || '').trim();
+    if (!raw) return null;
+
+    const system = [
+      'Você interpreta ordens do Matheus para uma central de controle de WhatsApp.',
+      'Retorne APENAS um objeto JSON, sem markdown.',
+      `Agora em America/Sao_Paulo: ${localIsoLike()}.`,
+      'Tipos permitidos:',
+      '{"type":"add_order","text":"..."}',
+      '{"type":"add_temporary_order","text":"...","expiresAt":"ISO-8601"}',
+      '{"type":"schedule_natural","target":"nome ou telefone","dueAt":"ISO-8601","message":"..."}',
+      '{"type":"pause","minutes":60}',
+      '{"type":"resume"}',
+      '{"type":"list_unanswered_today"}',
+      '{"type":"add_watcher","target":"nome","condition":"condição descrita pelo usuário"}',
+      '{"type":"no_groups_today"}',
+      '{"type":"help"}',
+      '{"type":"none"}',
+      'Regras:',
+      '- “responde o Davi se ele mandar mensagem” => add_order preservando o sentido.',
+      '- “se minha mãe perguntar onde tô fala que tô trabalhando” => add_order.',
+      '- Regras que explicitamente valem só hoje => add_temporary_order com expiresAt no fim de hoje, salvo se o texto indicar outro horário final.',
+      '- “amanhã 8h manda bom dia pra X” => schedule_natural. Resolva amanhã com base na data informada acima.',
+      '- “quando X chegar em casa me avisa” => add_watcher. Isso significa detectar pelas mensagens de X, não localização GPS.',
+      '- “me mostra quem ficou sem resposta hoje” => list_unanswered_today.',
+      '- “pausa o automático por 1 hora” => pause com minutos=60.',
+      '- “não responda grupos hoje” => no_groups_today.',
+      '- Se não for uma ordem da central, use none.'
+    ].join('\n');
+
+    let output = '';
+    if (GEMINI_API_KEY) {
+      const url = `${GEMINI_API_BASE}/${encodeURIComponent(GEMINI_REPLY_MODEL)}:generateContent`;
+      const payload = await fetchJsonWithTimeout(url, {
+        method: 'POST',
+        headers: { 'x-goog-api-key': GEMINI_API_KEY, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: system }] },
+          contents: [{ role: 'user', parts: [{ text: raw }] }],
+          generationConfig: { temperature: 0, maxOutputTokens: 350 }
+        })
+      }, GEMINI_TIMEOUT_MS, 'Gemini control');
+      output = (payload?.candidates?.[0]?.content?.parts || []).map(part => String(part?.text || '')).join('\n');
+    } else if (GROQ_API_KEY) {
+      const payload = await fetchJsonWithTimeout(GROQ_CHAT_URL, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${GROQ_API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: REPLY_MODEL,
+          messages: [{ role: 'system', content: system }, { role: 'user', content: raw }],
+          temperature: 0,
+          max_completion_tokens: 500,
+          ...(REPLY_MODEL.startsWith('openai/gpt-oss-') ? { reasoning_effort: 'low', include_reasoning: false } : {})
+        })
+      }, Math.max(GROQ_TIMEOUT_MS, 5000), 'Groq control');
+      output = String(payload?.choices?.[0]?.message?.content || '');
+    } else {
+      return null;
+    }
+
+    const parsed = extractJsonObject(output);
+    if (!parsed || typeof parsed.type !== 'string' || parsed.type === 'none') return null;
+    return parsed;
+  }
+
+  async function listUnansweredToday() {
+    const start = localDayStartSeconds();
+    const data = await bridge('/api/chats?limit=100');
+    const chats = (Array.isArray(data?.chats) ? data.chats : [])
+      .filter(chat => isDirectChatJid(chat?.id) && !isControlChat(chat.id))
+      .slice(0, 60);
+
+    const unanswered = [];
+    const concurrency = 6;
+    for (let offset = 0; offset < chats.length; offset += concurrency) {
+      const batch = chats.slice(offset, offset + concurrency);
+      const results = await Promise.all(batch.map(async chat => {
+        try {
+          const history = await bridge(`/api/chats/${encodeURIComponent(chat.id)}/messages?limit=30`);
+          const today = (Array.isArray(history?.messages) ? history.messages : []).filter(msg => Number(msg?.timestamp || 0) >= start);
+          if (!today.length) return null;
+          const last = today.at(-1);
+          if (!last || last.fromMe) return null;
+          return {
+            name: chat.name || chat.id,
+            text: String(last.text || '').trim().slice(0, 120),
+            timestamp: Number(last.timestamp || 0)
+          };
+        } catch { return null; }
+      }));
+      unanswered.push(...results.filter(Boolean));
+    }
+
+    unanswered.sort((a, b) => b.timestamp - a.timestamp);
+    if (!unanswered.length) return '✅ Não achei conversa direta pendente de resposta hoje.';
+    return `📥 Sem resposta hoje (${unanswered.length}):\n${unanswered.slice(0, 25).map(item => `• ${item.name}${item.text ? ` — ${item.text}` : ''}`).join('\n')}`;
+  }
+
+  function watcherMatches(watcher, message, chat) {
+    if (!watcher?.active || message?.fromMe) return false;
+    const chatName = normalizeCommand(chat?.name || chat?.pushName || message?.pushName || '');
+    const targetName = normalizeCommand(watcher.target || '');
+    const jidMatch = watcher.targetJid && String(watcher.targetJid).toLowerCase() === String(message.chatId || '').toLowerCase();
+    const nameMatch = targetName && chatName && (chatName.includes(targetName) || targetName.includes(chatName));
+    if (!jidMatch && !nameMatch) return false;
+
+    const text = normalizeCommand(message.text || '');
+    const condition = normalizeCommand(watcher.condition || '');
+    if (!text) return false;
+
+    if (condition.includes('chegar em casa') || condition.includes('chegou em casa') || condition.includes('chegue em casa')) {
+      return ['cheguei', 'cheguei em casa', 'to em casa', 'estou em casa', 'chegando em casa', 'cheguei aqui'].some(term => text.includes(term));
+    }
+    if (condition.includes('mandar mensagem') || condition.includes('falar comigo')) return true;
+    return condition ? text.includes(condition) : false;
+  }
+
+  async function checkWatchers(message, chat) {
+    if (!CONTROL_JID || !message?.chatId || message.fromMe) return;
+    const matched = state.watchers.filter(watcher => watcherMatches(watcher, message, chat));
+    for (const watcher of matched) {
+      watcher.active = false;
+      watcher.triggeredAt = Date.now();
+      watcher.triggerMessageId = message.id || null;
+      await send(CONTROL_JID, `🔔 ${watcher.id}: ${watcher.target} — ${watcher.condition}\nMensagem: ${String(message.text || '').slice(0, 500)}`);
+    }
+    if (matched.length) await saveState();
+  }
+
   async function applyControlCommand(message) {
     if (!message?.fromMe || !message?.id || message.id === state.lastControlMessageId) return false;
-    const action = parseControlAction(message.text);
-    if (!action) return false;
+
+    let action = parseControlAction(message.text);
+    if (!action) {
+      try { action = await interpretNaturalControl(message.text); }
+      catch (error) { console.warn(`[AutoReply] natural control failed: ${shortError(error)}`); }
+    }
 
     state.lastControlMessageId = message.id;
+    if (!action) {
+      await saveState();
+      return false;
+    }
 
     if (action.type === 'on') {
       const wasEnabled = state.enabled;
       state.enabled = true;
+      state.pauseUntil = 0;
       if (!wasEnabled) {
         state.enabledAt = Math.floor(Date.now() / 1000);
         processed.clear();
@@ -433,6 +640,7 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
 
     if (action.type === 'off') {
       state.enabled = false;
+      state.pauseUntil = 0;
       pendingChats.clear();
       for (const timer of debounceTimers.values()) clearTimeout(timer);
       debounceTimers.clear();
@@ -442,10 +650,32 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
       return true;
     }
 
+    if (action.type === 'pause') {
+      const minutes = action.minutes != null
+        ? Math.max(1, Number(action.minutes))
+        : Math.max(1, Number(action.amount || 1)) * (String(action.unit || '').startsWith('h') ? 60 : 1);
+      state.pauseUntil = Date.now() + minutes * 60000;
+      pendingChats.clear();
+      for (const timer of debounceTimers.values()) clearTimeout(timer);
+      debounceTimers.clear();
+      await saveState();
+      await send(CONTROL_JID, `⏸️ Automático pausado até ${formatLocalDateTime(state.pauseUntil)}.`);
+      return true;
+    }
+
+    if (action.type === 'resume') {
+      state.pauseUntil = 0;
+      await saveState();
+      await send(CONTROL_JID, state.enabled ? '▶️ Automático retomado.' : '🔕 O automático está OFF. Mande auto on para ligar.');
+      return true;
+    }
+
     if (action.type === 'status') {
       await saveState();
       const pendingCount = state.scheduled.filter(job => job.status === 'pending').length;
-      await send(CONTROL_JID, `${state.enabled ? '🤖 ON' : '🔕 OFF'} | ordens: ${state.orders.length} | recados: ${state.notes.length} | agendados: ${pendingCount}`);
+      const activeWatchers = state.watchers.filter(item => item.active).length;
+      const pauseText = isPaused() ? ` | pausado até ${formatLocalDateTime(state.pauseUntil)}` : '';
+      await send(CONTROL_JID, `${state.enabled ? '🤖 ON' : '🔕 OFF'}${pauseText} | ordens: ${state.orders.length} | recados: ${state.notes.length} | alertas: ${activeWatchers} | agendados: ${pendingCount}`);
       return true;
     }
 
@@ -455,27 +685,66 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
       return true;
     }
 
-    if (action.type === 'add_order') {
+    if (action.type === 'add_order' || action.type === 'add_temporary_order') {
       if (!action.text) return true;
-      state.orders.push({ text: action.text.slice(0, 1500), createdAt: Date.now() });
-      state.orders = state.orders.slice(-30);
+      let expiresAt = null;
+      if (action.type === 'add_temporary_order') {
+        const parsed = Date.parse(String(action.expiresAt || ''));
+        expiresAt = Number.isFinite(parsed) && parsed > Date.now() ? parsed : localDayEndTimestamp();
+      }
+      state.orders.push({ text: String(action.text).slice(0, 1500), createdAt: Date.now(), ...(expiresAt ? { expiresAt } : {}) });
+      state.orders = state.orders.slice(-50);
       await saveState();
-      await send(CONTROL_JID, `🧠 Ordem salva. Agora tenho ${state.orders.length} ordem(ns) ativa(s).`);
+      await send(CONTROL_JID, expiresAt ? `🧠 Ordem temporária salva até ${formatLocalDateTime(expiresAt)}.` : `🧠 Ordem salva. Agora tenho ${state.orders.length} ordem(ns) ativa(s).`);
       return true;
     }
 
     if (action.type === 'add_note') {
       if (!action.text) return true;
-      state.notes.push({ text: action.text.slice(0, 1500), createdAt: Date.now() });
+      state.notes.push({ text: String(action.text).slice(0, 1500), createdAt: Date.now() });
       state.notes = state.notes.slice(-50);
       await saveState();
       await send(CONTROL_JID, `📝 Recado salvo. Agora tenho ${state.notes.length} recado(s).`);
       return true;
     }
 
+    if (action.type === 'add_watcher') {
+      const target = String(action.target || '').trim();
+      const condition = String(action.condition || '').trim();
+      if (!target || !condition) {
+        await send(CONTROL_JID, '⚠️ Não consegui entender quem ou o que devo observar.');
+        return true;
+      }
+      const resolved = await resolveTarget(target);
+      const watcher = {
+        id: `W${state.nextWatcherId++}`,
+        target,
+        targetJid: resolved?.id || null,
+        condition: condition.slice(0, 500),
+        active: true,
+        createdAt: Date.now()
+      };
+      state.watchers.push(watcher);
+      state.watchers = state.watchers.slice(-50);
+      await saveState();
+      await send(CONTROL_JID, `🔔 ${watcher.id} criado: quando ${target} indicar “${condition}”, eu te aviso aqui.`);
+      return true;
+    }
+
+    if (action.type === 'no_groups_today') {
+      await send(CONTROL_JID, '👍 Fechado. O automático já ignora grupos por padrão, então hoje continua sem responder nenhum grupo.');
+      return true;
+    }
+
+    if (action.type === 'list_unanswered_today') {
+      await send(CONTROL_JID, await listUnansweredToday());
+      return true;
+    }
+
     if (action.type === 'list_orders') {
-      const text = state.orders.length
-        ? `🧠 Ordens atuais:\n${state.orders.map((item, i) => `${i + 1}. ${item.text}`).join('\n')}`
+      const active = state.orders.filter(item => !item?.expiresAt || Number(item.expiresAt) > Date.now());
+      const text = active.length
+        ? `🧠 Ordens atuais:\n${active.map((item, i) => `${i + 1}. ${item.text}${item.expiresAt ? ` (até ${formatLocalDateTime(item.expiresAt)})` : ''}`).join('\n')}`
         : '🧠 Nenhuma ordem salva.';
       await send(CONTROL_JID, text.slice(0, 5000));
       return true;
@@ -503,6 +772,23 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
       return true;
     }
 
+    if (action.type === 'schedule_natural') {
+      const dueAt = Date.parse(String(action.dueAt || ''));
+      if (!Number.isFinite(dueAt) || dueAt <= Date.now()) {
+        await send(CONTROL_JID, '⚠️ Entendi que era um agendamento, mas não consegui fechar uma data/hora futura.');
+        return true;
+      }
+      const resolved = await resolveTarget(action.target);
+      if (!resolved) {
+        await send(CONTROL_JID, `⚠️ Não achei uma conversa única para “${String(action.target || '').slice(0, 120)}”. Tente usar o nome exatamente como aparece no WhatsApp ou o número.`);
+        return true;
+      }
+      const job = addScheduled(resolved.id, dueAt, action.message, resolved.name);
+      await saveState();
+      await send(CONTROL_JID, `⏰ ${job.id} agendado para ${formatLocalDateTime(job.dueAt)} → ${job.displayName || job.target}\n${job.message.slice(0, 300)}`);
+      return true;
+    }
+
     if (action.type === 'schedule' || action.type === 'schedule_short') {
       let dueAt;
       if (action.type === 'schedule') {
@@ -515,25 +801,29 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
         await send(CONTROL_JID, '⚠️ Não consegui entender a data/hora ou o horário já passou. Ex.: agendar +5541... amanhã 15:30 | mensagem');
         return true;
       }
-      const job = addScheduled(action.target, dueAt, action.message);
+      const resolved = await resolveTarget(action.target);
+      const destination = resolved || { id: action.target, name: action.target };
+      const job = addScheduled(destination.id, dueAt, action.message, destination.name);
       await saveState();
-      await send(CONTROL_JID, `⏰ ${job.id} agendado para ${formatLocalDateTime(job.dueAt)} → ${job.target}`);
+      await send(CONTROL_JID, `⏰ ${job.id} agendado para ${formatLocalDateTime(job.dueAt)} → ${job.displayName || job.target}`);
       return true;
     }
 
     if (action.type === 'schedule_relative') {
-      const multiplier = action.unit.startsWith('h') ? 3600000 : 60000;
+      const multiplier = String(action.unit || '').startsWith('h') ? 3600000 : 60000;
       const dueAt = Date.now() + Math.max(1, action.amount) * multiplier;
-      const job = addScheduled(action.target, dueAt, action.message);
+      const resolved = await resolveTarget(action.target);
+      const destination = resolved || { id: action.target, name: action.target };
+      const job = addScheduled(destination.id, dueAt, action.message, destination.name);
       await saveState();
-      await send(CONTROL_JID, `⏰ ${job.id} agendado para ${formatLocalDateTime(job.dueAt)} → ${job.target}`);
+      await send(CONTROL_JID, `⏰ ${job.id} agendado para ${formatLocalDateTime(job.dueAt)} → ${job.displayName || job.target}`);
       return true;
     }
 
     if (action.type === 'list_schedule') {
       const pending = state.scheduled.filter(job => job.status === 'pending');
       const text = pending.length
-        ? `⏰ Agenda:\n${pending.map(job => `${job.id} — ${formatLocalDateTime(job.dueAt)} → ${job.target}\n${job.message.slice(0, 180)}`).join('\n\n')}`
+        ? `⏰ Agenda:\n${pending.map(job => `${job.id} — ${formatLocalDateTime(job.dueAt)} → ${job.displayName || job.target}\n${job.message.slice(0, 180)}`).join('\n\n')}`
         : '⏰ Nenhuma mensagem agendada.';
       await send(CONTROL_JID, text.slice(0, 5000));
       return true;
@@ -560,10 +850,8 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
     try {
       const data = await bridge(`/api/chats/${encodeURIComponent(CONTROL_JID)}/messages?limit=20`);
       const messages = Array.isArray(data?.messages) ? data.messages : [];
-      const latestCommand = [...messages]
-        .reverse()
-        .find(message => message?.fromMe && message?.id && parseControlAction(message.text));
-      if (latestCommand) await applyControlCommand(latestCommand);
+      const latestFromMe = [...messages].reverse().find(message => message?.fromMe && message?.id);
+      if (latestFromMe && latestFromMe.id !== state.lastControlMessageId) await applyControlCommand(latestFromMe);
     } catch (error) {
       console.warn('[AutoReply] control fallback failed:', error?.message || error);
     }
@@ -579,7 +867,7 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
         job.status = 'sent';
         job.sentAt = Date.now();
         console.log(`[AutoReply] scheduled sent id=${job.id} target=${job.target}`);
-        if (CONTROL_JID) await send(CONTROL_JID, `✅ ${job.id} enviado para ${job.target}.`);
+        if (CONTROL_JID) await send(CONTROL_JID, `✅ ${job.id} enviado para ${job.displayName || job.target}.`);
       } catch (error) {
         console.warn(`[AutoReply] scheduled id=${job.id} failed: ${shortError(error)}`);
         if (job.attempts < 3) {
@@ -650,7 +938,7 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
   }
 
   async function createReply(messages, currentText, chat) {
-    const history = messages.slice(-24).flatMap(message => {
+    const history = messages.slice(-28).flatMap(message => {
       const text = String(message?.text || '').trim();
       if (!text) return [];
       return [{ role: message.fromMe ? 'assistant' : 'user', content: text.slice(0, 900) }];
@@ -679,28 +967,40 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
     }
   }
 
+  async function collectIncomingText(chatId, incoming) {
+    const chunks = [];
+    for (const item of incoming.slice(-10)) {
+      let text = String(item?.text || '').trim();
+      if (!text && item?.audio?.available) {
+        try { text = await transcribe(chatId, item.id); }
+        catch (error) { console.warn(`[AutoReply] batch audio ${item.id} failed: ${shortError(error)}`); }
+      }
+      if (text) chunks.push(text);
+    }
+    return chunks.join('\n').trim();
+  }
+
   async function processChat(chat) {
     const chatId = String(chat?.id || '');
-    if (!state.enabled || !isDirectChatJid(chatId) || isControlChat(chatId)) return;
+    if (!state.enabled || isPaused() || !isDirectChatJid(chatId) || isControlChat(chatId)) return;
 
     const cutoff = Math.max(startedAt, Number(state.enabledAt || 0));
-    const data = await bridge(`/api/chats/${encodeURIComponent(chatId)}/messages?limit=30`);
+    const data = await bridge(`/api/chats/${encodeURIComponent(chatId)}/messages?limit=40`);
     const messages = Array.isArray(data?.messages) ? data.messages : [];
     const incoming = messages.filter(message => message?.id && !message.fromMe && Number(message.timestamp || 0) >= cutoff && !processed.has(message.id));
     if (!incoming.length) return;
 
     const current = incoming.at(-1);
+    const text = await collectIncomingText(chatId, incoming);
+    if (!text || !state.enabled || isPaused()) return;
+
     rememberProcessed(incoming);
     latestIncomingId.set(chatId, current.id);
     const eventStartedAt = performance.now();
 
-    let text = String(current?.text || '').trim();
-    if (!text && current?.audio?.available) text = await transcribe(chatId, current.id);
-    if (!text || !state.enabled) return;
-
     const reply = await createReply(messages, text, chat);
     const replyParts = splitReply(reply);
-    if (!replyParts.length || !state.enabled) return;
+    if (!replyParts.length || !state.enabled || isPaused()) return;
 
     if (latestIncomingId.get(chatId) !== current.id) {
       scheduleChat(chat);
@@ -708,23 +1008,23 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
     }
 
     await sleep(randomBetween(DELAY_MIN_MS, DELAY_MAX_MS));
-    if (!state.enabled || latestIncomingId.get(chatId) !== current.id) {
-      if (state.enabled) scheduleChat(chat);
+    if (!state.enabled || isPaused() || latestIncomingId.get(chatId) !== current.id) {
+      if (state.enabled && !isPaused()) scheduleChat(chat);
       return;
     }
 
     for (let index = 0; index < replyParts.length; index += 1) {
-      if (!state.enabled) return;
+      if (!state.enabled || isPaused()) return;
       await send(chatId, `${PREFIX}${replyParts[index]}`);
       if (index < replyParts.length - 1) await sleep(randomBetween(INTERPART_MIN_MS, INTERPART_MAX_MS));
     }
 
-    console.log(`[AutoReply] sent chat=${chatId} message=${current.id} parts=${replyParts.length} total=${Math.round(performance.now() - eventStartedAt)}ms`);
+    console.log(`[AutoReply] sent chat=${chatId} message=${current.id} batch=${incoming.length} parts=${replyParts.length} total=${Math.round(performance.now() - eventStartedAt)}ms`);
   }
 
   function pumpQueue() {
     if (stopped) return;
-    while (state.enabled && activeWorkers < CONCURRENCY && pendingChats.size) {
+    while (state.enabled && !isPaused() && activeWorkers < CONCURRENCY && pendingChats.size) {
       const [chatId, chat] = pendingChats.entries().next().value;
       pendingChats.delete(chatId);
       activeWorkers += 1;
@@ -739,14 +1039,14 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
 
   function enqueueChat(chat) {
     const chatId = String(chat?.id || '');
-    if (!chatId || !state.enabled) return;
+    if (!chatId || !state.enabled || isPaused()) return;
     pendingChats.set(chatId, chat);
     pumpQueue();
   }
 
   function scheduleChat(chat) {
     const chatId = String(chat?.id || '');
-    if (!chatId || !state.enabled) return;
+    if (!chatId || !state.enabled || isPaused()) return;
     const existing = debounceTimers.get(chatId);
     if (existing) clearTimeout(existing);
     debounceTimers.set(chatId, setTimeout(() => {
@@ -763,7 +1063,12 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
       return;
     }
 
-    if (!state.enabled || message.fromMe || !isDirectChatJid(message.chatId)) return;
+    if (!message.fromMe) {
+      void checkWatchers(message, chat || { id: message.chatId, name: message.pushName || null })
+        .catch(error => console.warn(`[AutoReply] watcher failed: ${shortError(error)}`));
+    }
+
+    if (!state.enabled || isPaused() || message.fromMe || !isDirectChatJid(message.chatId)) return;
     const cutoff = Math.max(startedAt, Number(state.enabledAt || 0));
     if (Number(message.timestamp || 0) < cutoff) return;
     latestIncomingId.set(message.chatId, message.id);
@@ -776,7 +1081,7 @@ export function startAutoReplyService({ bridgePort, audioPort }) {
     await loadState();
     initialized = true;
     if (!CONTROL_JID) console.warn('[AutoReply] Configure AUTO_REPLY_CONTROL_JID (preferred) or AUTO_REPLY_CONTROL_NUMBER; automatic mode cannot be controlled until then.');
-    console.log(`[AutoReply] state=${state.enabled ? 'ON' : 'OFF'} model=${REPLY_MODEL} fallback=${GEMINI_API_KEY ? GEMINI_REPLY_MODEL : 'disabled'} control=${CONTROL_JID ? 'configured' : 'missing'} orders=${state.orders.length} notes=${state.notes.length} scheduled=${state.scheduled.filter(job => job.status === 'pending').length} eventDriven=true concurrency=${CONCURRENCY} debounce=${DEBOUNCE_MS}ms delay=${DELAY_MIN_MS}-${DELAY_MAX_MS}ms maxTokens=${REPLY_MAX_TOKENS} groqTimeout=${GROQ_TIMEOUT_MS}ms`);
+    console.log(`[AutoReply] state=${state.enabled ? 'ON' : 'OFF'} model=${REPLY_MODEL} fallback=${GEMINI_API_KEY ? GEMINI_REPLY_MODEL : 'disabled'} control=${CONTROL_JID ? 'configured' : 'missing'} orders=${state.orders.length} notes=${state.notes.length} watchers=${state.watchers.filter(item => item.active).length} scheduled=${state.scheduled.filter(job => job.status === 'pending').length} eventDriven=true concurrency=${CONCURRENCY} debounce=${DEBOUNCE_MS}ms delay=${DELAY_MIN_MS}-${DELAY_MAX_MS}ms maxTokens=${REPLY_MAX_TOKENS} groqTimeout=${GROQ_TIMEOUT_MS}ms`);
     await checkControlFallback();
     await runScheduledMessages();
     controlFallbackTimer = setInterval(() => void checkControlFallback(), CONTROL_FALLBACK_MS);
