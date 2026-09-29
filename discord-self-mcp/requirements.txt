@@ -1,4 +1,4 @@
-discord.py-self>=2.1.0,<3
+discord.py-self[voice]>=2.1.0,<3
 fastapi>=0.116,<1
 uvicorn[standard]>=0.35,<1
 httpx>=0.28,<1
