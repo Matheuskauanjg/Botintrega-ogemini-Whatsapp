@@ -253,3 +253,39 @@ async def send_message_with_voice(body: base.SendMessageBody) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=f"Unable to send message: {exc}") from exc
 
     return {"ok": True, "message": base.message_payload(sent)}
+
+
+# Replace chat listing so voice/stage channels are discoverable through the existing MCP tool.
+for route in list(app.router.routes):
+    if getattr(route, "path", None) == "/api/chats" and "GET" in (getattr(route, "methods", set()) or set()):
+        app.router.routes.remove(route)
+
+
+@app.get("/api/chats", dependencies=[Depends(base.require_api_token)])
+async def list_chats_with_voice(
+    limit: int = base.Query(default=30, ge=1, le=100),
+    includeGuilds: bool = True,
+    includeDMs: bool = True,
+) -> dict[str, Any]:
+    await base.require_ready()
+    channels: list[Any] = []
+
+    if includeDMs:
+        channels.extend(client.private_channels)
+
+    if includeGuilds:
+        for guild in client.guilds:
+            channels.extend(guild.text_channels)
+            channels.extend(getattr(guild, "voice_channels", []) or [])
+            channels.extend(getattr(guild, "stage_channels", []) or [])
+
+    channels = [channel for channel in channels if getattr(channel, "id", None)]
+    channels.sort(
+        key=lambda channel: base.snowflake_ts(getattr(channel, "last_message_id", None)),
+        reverse=True,
+    )
+
+    return {
+        "chats": [base.channel_payload(channel) for channel in channels[:limit]],
+        "count": min(limit, len(channels)),
+    }
