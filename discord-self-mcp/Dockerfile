@@ -29,6 +29,7 @@ RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
 COPY . .
+RUN chmod +x /app/python-wrapper.sh
 
 EXPOSE 10000
 CMD ["npm", "start"]
