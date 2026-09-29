@@ -1,0 +1,20 @@
+{
+  "name": "meu-discord-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Personal Discord bridge using discord.py-self with MCP support for ChatGPT",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/node": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "express": "^4.21.2",
+    "zod": "^4.6.5"
+  }
+}
