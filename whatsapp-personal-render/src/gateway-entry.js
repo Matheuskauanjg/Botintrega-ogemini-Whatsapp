@@ -2,11 +2,13 @@ import 'dotenv/config';
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 
 const publicPort = Number(process.env.PORT || 10000);
 const bridgePort = Number(process.env.BRIDGE_INTERNAL_PORT || 10001);
 const mcpGatewayPort = Number(process.env.MCP_GATEWAY_INTERNAL_PORT || 10002);
 const audioHandoffPort = Number(process.env.AUDIO_HANDOFF_INTERNAL_PORT || 10003);
+const discordPort = Number(process.env.DISCORD_INTERNAL_PORT || 10004);
 
 if (!process.env.API_TOKEN && process.env.QR_SECRET) {
   process.env.API_TOKEN = process.env.QR_SECRET;
@@ -61,11 +63,40 @@ startAudioHandoffProxy({ listenPort: audioHandoffPort, bridgePort });
 const { startAutoReplyService } = await import('./auto-reply-service.js');
 startAutoReplyService({ bridgePort, audioPort: audioHandoffPort });
 
-// 4) MCP/OAuth: texto e histórico vão direto ao bridge; áudio usa o proxy de transcrição.
-const { startMcpGateway } = await import('./mcp-gateway-v5.js');
-await startMcpGateway({ publicPort: mcpGatewayPort, bridgePort, audioPort: audioHandoffPort });
+// 4) Discord pessoal via discord.py-self em processo interno isolado.
+const discordProcess = spawn('python3', ['src/discord-self-service.py'], {
+  cwd: process.cwd(),
+  stdio: 'inherit',
+  env: {
+    ...process.env,
+    DISCORD_INTERNAL_PORT: String(discordPort)
+  }
+});
+discordProcess.on('error', error => console.error('[DiscordSelf] Falha ao iniciar processo Python:', error));
+discordProcess.on('exit', (code, signal) => {
+  if (code !== 0 && signal !== 'SIGTERM' && signal !== 'SIGINT') {
+    console.error(`[DiscordSelf] Processo finalizado inesperadamente code=${code} signal=${signal || 'none'}`);
+  }
+});
 
-// 5) Proxy público de compatibilidade do ChatGPT.
+// 5) MCP/OAuth unificado: WhatsApp e Discord aparecem no mesmo plugin.
+const { startMcpGateway } = await import('./mcp-gateway-v6.js');
+await startMcpGateway({
+  publicPort: mcpGatewayPort,
+  bridgePort,
+  audioPort: audioHandoffPort,
+  discordPort
+});
+
+// 6) Proxy público de compatibilidade do ChatGPT.
 process.env.PORT = String(publicPort);
 const { startPublicMcpProxy } = await import('./public-mcp-proxy.js');
 startPublicMcpProxy({ publicPort, targetPort: mcpGatewayPort });
+
+function stopDiscordProcess() {
+  try {
+    if (!discordProcess.killed) discordProcess.kill('SIGTERM');
+  } catch (_) {}
+}
+process.once('SIGTERM', stopDiscordProcess);
+process.once('SIGINT', stopDiscordProcess);
