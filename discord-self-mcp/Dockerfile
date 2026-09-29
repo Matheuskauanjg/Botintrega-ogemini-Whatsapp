@@ -28,6 +28,7 @@ RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
     && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
+COPY yt-dlp.conf /etc/yt-dlp.conf
 COPY . .
 RUN chmod +x /app/python-wrapper.sh
 
