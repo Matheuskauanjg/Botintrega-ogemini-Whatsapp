@@ -26,7 +26,8 @@ RUN npm install --omit=dev
 COPY requirements.txt ./
 RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
+    && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt \
+    && /opt/venv/bin/pip install --no-cache-dir --no-deps discord-native-voice==0.1.1
 
 COPY yt-dlp.conf /etc/yt-dlp.conf
 COPY . .
