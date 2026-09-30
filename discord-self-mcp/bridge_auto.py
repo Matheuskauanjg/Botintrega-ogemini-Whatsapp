@@ -1,8 +1,11 @@
+import ast
 import asyncio
+import math
 import os
 import random
 import re
 import time
+import unicodedata
 from collections import defaultdict, deque
 from typing import Any
 
@@ -25,19 +28,23 @@ AUTO_REPLY_TRIGGERS = [
     if item.strip()
 ]
 AUTO_REPLY_COOLDOWN_SECONDS = max(0.0, float(os.getenv("AUTO_REPLY_COOLDOWN_SECONDS", "5")))
+AUTO_REPLY_DUPLICATE_WINDOW_SECONDS = max(0.0, float(os.getenv("AUTO_REPLY_DUPLICATE_WINDOW_SECONDS", "12")))
 AUTO_REPLY_MAX_CONTEXT = max(1, min(100, int(os.getenv("AUTO_REPLY_MAX_CONTEXT", "60"))))
 AUTO_REPLY_CONTEXT_CHARS = max(1500, min(24000, int(os.getenv("AUTO_REPLY_CONTEXT_CHARS", "12000"))))
 AUTO_REPLY_MAX_CHARS = max(50, min(1500, int(os.getenv("AUTO_REPLY_MAX_CHARS", "450"))))
 GROQ_AUTO_REPLY_MODEL = os.getenv("GROQ_AUTO_REPLY_MODEL", "openai/gpt-oss-120b").strip()
 
 _last_reply_at: dict[tuple[int, int], float] = defaultdict(float)
+_last_seen_message: dict[tuple[int, int, str], float] = {}
 _recent_bot_replies: deque[str] = deque(maxlen=12)
 auto_reply_stats: dict[str, Any] = {
     "matched": 0,
     "replied": 0,
     "skippedCooldown": 0,
+    "skippedDuplicate": 0,
     "skippedChannel": 0,
     "groqFailures": 0,
+    "smartFallbacks": 0,
     "lastTrigger": None,
     "lastReplyAt": None,
     "lastModelError": None,
@@ -60,27 +67,162 @@ def _trigger_match(message) -> tuple[bool, str | None]:
     return False, None
 
 
-def _fallback_reply(message, trigger: str | None) -> str:
-    author_name = getattr(message.author, "display_name", None) or getattr(message.author, "name", "mano")
-    content = (message.content or "").strip()
-    cleaned = content
+def _normalize(value: str) -> str:
+    value = unicodedata.normalize("NFKD", value.casefold())
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _clean_message_text(message) -> str:
+    cleaned = (message.content or "").strip()
     if client.user is not None:
         cleaned = re.sub(rf"<@!?{client.user.id}>", "", cleaned).strip()
     for item in AUTO_REPLY_TRIGGERS:
         cleaned = re.sub(rf"(?<!\w){re.escape(item)}(?!\w)", "", cleaned, flags=re.IGNORECASE).strip()
+    return re.sub(r"\s+", " ", cleaned).strip()
 
+
+def _format_number(value: float) -> str:
+    if abs(value - round(value)) < 1e-10:
+        return str(int(round(value)))
+    return f"{value:.6f}".rstrip("0").rstrip(".").replace(".", ",")
+
+
+def _extract_last_number(context: list[dict[str, str]]) -> float | None:
+    pattern = re.compile(r"(?<![\w])[-+]?\d+(?:[.,]\d+)?(?![\w])")
+    for row in reversed(context):
+        matches = pattern.findall(row.get("content", ""))
+        if not matches:
+            continue
+        try:
+            return float(matches[-1].replace(",", "."))
+        except ValueError:
+            continue
+    return None
+
+
+def _safe_eval_expression(expression: str) -> float | None:
+    operators = {
+        ast.Add: lambda a, b: a + b,
+        ast.Sub: lambda a, b: a - b,
+        ast.Mult: lambda a, b: a * b,
+        ast.Div: lambda a, b: a / b,
+        ast.FloorDiv: lambda a, b: a // b,
+        ast.Mod: lambda a, b: a % b,
+        ast.Pow: lambda a, b: a**b,
+    }
+
+    def visit(node: ast.AST) -> float:
+        if isinstance(node, ast.Expression):
+            return visit(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            value = float(node.value)
+            if not math.isfinite(value) or abs(value) > 1e15:
+                raise ValueError("number out of range")
+            return value
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            value = visit(node.operand)
+            return value if isinstance(node.op, ast.UAdd) else -value
+        if isinstance(node, ast.BinOp) and type(node.op) in operators:
+            left = visit(node.left)
+            right = visit(node.right)
+            if isinstance(node.op, ast.Pow) and abs(right) > 12:
+                raise ValueError("exponent too large")
+            result = operators[type(node.op)](left, right)
+            if not math.isfinite(result) or abs(result) > 1e18:
+                raise ValueError("result out of range")
+            return float(result)
+        raise ValueError("unsupported expression")
+
+    try:
+        cleaned = expression.replace(",", ".").replace("×", "*").replace("÷", "/").replace("^", "**")
+        tree = ast.parse(cleaned, mode="eval")
+        return visit(tree)
+    except Exception:
+        return None
+
+
+def _smart_fallback_reply(message, trigger: str | None, context: list[dict[str, str]]) -> str:
+    author_name = getattr(message.author, "display_name", None) or getattr(message.author, "name", "mano")
+    cleaned = _clean_message_text(message)
+    normalized = _normalize(cleaned)
+    last_number = _extract_last_number(context)
+
+    # Conversation-aware arithmetic such as "multiplique por 2" or "qual a raiz desse número?".
+    if last_number is not None:
+        match = re.search(r"multiplic(?:a|ar|e|ado)?(?:\s+isso|\s+esse numero)?\s+por\s+(-?\d+(?:[.,]\d+)?)", normalized)
+        if match:
+            factor = float(match.group(1).replace(",", "."))
+            result = last_number * factor
+            return f"{_format_number(last_number)} × {_format_number(factor)} = **{_format_number(result)}** 😏"
+
+        match = re.search(r"divid(?:a|ir|e|ido)?(?:\s+isso|\s+esse numero)?\s+por\s+(-?\d+(?:[.,]\d+)?)", normalized)
+        if match:
+            divisor = float(match.group(1).replace(",", "."))
+            if divisor != 0:
+                result = last_number / divisor
+                return f"{_format_number(last_number)} ÷ {_format_number(divisor)} = **{_format_number(result)}**"
+
+        if "raiz" in normalized and ("desse numero" in normalized or "deste numero" in normalized or "desse valor" in normalized):
+            if last_number < 0:
+                return "Nos reais não tem raiz quadrada desse número porque ele é negativo 👀"
+            result = math.sqrt(last_number)
+            return f"A raiz quadrada de {_format_number(last_number)} é **{_format_number(result)}**."
+
+    # Explicit square-root questions.
+    match = re.search(r"raiz(?: quadrada)?(?: de| do)?\s*(-?\d+(?:[.,]\d+)?)", normalized)
+    if match:
+        value = float(match.group(1).replace(",", "."))
+        if value < 0:
+            return "Nos números reais, raiz quadrada de número negativo não existe 👀"
+        return f"√{_format_number(value)} = **{_format_number(math.sqrt(value))}**."
+
+    # Common derivatives of x^n.
+    if "derivada" in normalized:
+        exponent_match = re.search(r"x\s*(?:\^|elevad[oa]\s+a(?:o)?\s*)\s*(-?\d+(?:[.,]\d+)?)", normalized)
+        if exponent_match:
+            exponent = float(exponent_match.group(1).replace(",", "."))
+            new_exp = exponent - 1
+            if exponent == 0:
+                answer = "0"
+            elif exponent == 1:
+                answer = "1"
+            elif exponent == 2:
+                answer = "2x"
+            else:
+                answer = f"{_format_number(exponent)}x^{_format_number(new_exp)}"
+            return f"A derivada de x^{_format_number(exponent)} é **{answer}**. Regra: desce o expoente e subtrai 1 dele."
+
+        if any(phrase in normalized for phrase in ("o que e derivada", "sabe o que e derivada", "que e derivada")):
+            return "Sei sim kkk. Derivada mede como uma função varia; geometricamente, é a inclinação da reta tangente naquele ponto."
+
+    if any(phrase in normalized for phrase in ("quais contas", "que contas", "o que voce consegue calcular", "o que vc consegue calcular")):
+        return "Faço aritmética, potência, raiz, porcentagem, regra de três, equações simples e derivadas básicas. Manda uma aí 😏"
+
+    # Try a plain arithmetic expression embedded in a question.
+    expr_match = re.search(r"(?:quanto(?: e| da)?|resultado(?: de)?|calcule|calcula)\s*[:=]?\s*([0-9\s+\-*/().,^×÷]+)", normalized)
+    if expr_match:
+        expression = expr_match.group(1).strip().rstrip("?.!")
+        value = _safe_eval_expression(expression)
+        if value is not None:
+            return f"Dá **{_format_number(value)}**."
+
+    if any(insult in normalized for insult in ("vai tomar no cu", "va tomar no cu", "seu cu", "fdp", "filho da puta")):
+        if "derivada" in " ".join(row.get("content", "").casefold() for row in context[-8:]):
+            return f"KKKKKK calma {author_name}, a derivada te estressou foi?"
+        return f"KKKKKK qual foi {author_name} 💀"
+
+    # Generic fallback only after trying to answer the actual content.
     if "?" in cleaned:
         options = [
-            f"aí tu me quebra {author_name} kkkkk",
-            f"pergunta forte essa aí {author_name} 💀",
-            f"depende, qual é tua teoria {author_name}?",
-            f"do nada essa pergunta {author_name} KKKKK",
+            f"essa eu não peguei direito, manda de outro jeito {author_name}",
+            f"explica melhor essa aí {author_name} kkkkk",
+            f"essa ficou ambígua pra mim, reformula aí {author_name}",
         ]
     elif cleaned:
         options = [
             f"KKKKKK qual foi {author_name}",
             f"tô vendo isso aí {author_name} kkkkk",
-            f"fala mais {author_name}, agora fiquei curioso",
             f"aí tu lançou essa e saiu correndo né {author_name} KKKK",
         ]
     else:
@@ -88,8 +230,6 @@ def _fallback_reply(message, trigger: str | None) -> str:
             f"fala {author_name} kkkkk",
             f"qual foi {author_name} 💀",
             f"manda aí {author_name}",
-            f"tô aqui {author_name}, desembucha kkkkk",
-            f"chamou de novo {author_name}? KKKK",
         ]
 
     available = [item for item in options if item not in _recent_bot_replies]
@@ -124,11 +264,12 @@ async def _recent_context(message) -> list[dict[str, str]]:
 async def _generate_reply(message, trigger: str | None) -> str:
     author_name = getattr(message.author, "display_name", None) or getattr(message.author, "name", "alguém")
     content = (message.content or "").strip()
+    context = await _recent_context(message)
 
     if not base.GROQ_API_KEY:
-        return _fallback_reply(message, trigger)
+        auto_reply_stats["smartFallbacks"] += 1
+        return _smart_fallback_reply(message, trigger, context)
 
-    context = await _recent_context(message)
     context_text = "\n".join(f"{row['name']}: {row['content']}" for row in context)
     recent_replies = "\n".join(f"- {item}" for item in _recent_bot_replies) or "(nenhuma)"
     user_prompt = (
@@ -143,7 +284,7 @@ async def _generate_reply(message, trigger: str | None) -> str:
 
     payload = {
         "model": GROQ_AUTO_REPLY_MODEL,
-        "temperature": 1.0,
+        "temperature": 0.85,
         "max_completion_tokens": 180,
         "messages": [
             {
@@ -153,7 +294,8 @@ async def _generate_reply(message, trigger: str | None) -> str:
                     "Fale em português do Brasil de forma curta, espontânea e informal, como alguém do grupo. "
                     "A mensagem atual é o foco principal, mas entenda toda a conversa recente fornecida antes de responder. "
                     "Mensagens sem menção também fazem parte do contexto e podem explicar piadas, assunto e continuidade. "
-                    "Se houver uma pergunta, responda a pergunta; não responda apenas 'chamou?'. "
+                    "Se houver uma pergunta factual ou matemática, responda corretamente e diretamente antes de brincar. "
+                    "Se a pessoa usar expressões como 'esse número', 'isso', 'agora multiplica' ou similares, resolva a referência usando a conversa recente. "
                     "Se for só uma menção sem assunto, pode perguntar o que a pessoa quer, mas varie a frase. "
                     "Nunca copie uma das respostas recentes listadas no prompt e evite bordões repetidos. "
                     "Pode usar risadas como kkk/KKKK e emoji ocasionalmente, sem exagerar. "
@@ -182,13 +324,15 @@ async def _generate_reply(message, trigger: str | None) -> str:
             raise RuntimeError("Groq returned an empty reply")
         reply = reply[:AUTO_REPLY_MAX_CHARS]
         if reply in _recent_bot_replies:
-            return _fallback_reply(message, trigger)
+            auto_reply_stats["smartFallbacks"] += 1
+            return _smart_fallback_reply(message, trigger, context)
         return reply
     except Exception as exc:
         auto_reply_stats["groqFailures"] += 1
+        auto_reply_stats["smartFallbacks"] += 1
         auto_reply_stats["lastModelError"] = f"{type(exc).__name__}: {exc}"[:700]
         print(f"[AutoReply] Groq fallback: {type(exc).__name__}: {exc}", flush=True)
-        return _fallback_reply(message, trigger)
+        return _smart_fallback_reply(message, trigger, context)
 
 
 @client.event
@@ -215,6 +359,20 @@ async def on_message(message) -> None:
     if not matched:
         return
 
+    normalized_message = _normalize(_clean_message_text(message))
+    duplicate_key = (int(message.channel.id), int(author.id), normalized_message)
+    now = time.monotonic()
+    previous_seen = _last_seen_message.get(duplicate_key, 0.0)
+    if normalized_message and AUTO_REPLY_DUPLICATE_WINDOW_SECONDS and now - previous_seen < AUTO_REPLY_DUPLICATE_WINDOW_SECONDS:
+        auto_reply_stats["skippedDuplicate"] += 1
+        return
+    _last_seen_message[duplicate_key] = now
+    if len(_last_seen_message) > 500:
+        cutoff = now - max(60.0, AUTO_REPLY_DUPLICATE_WINDOW_SECONDS * 4)
+        for key, seen_at in list(_last_seen_message.items()):
+            if seen_at < cutoff:
+                _last_seen_message.pop(key, None)
+
     auto_reply_stats["matched"] += 1
     auto_reply_stats["lastTrigger"] = {
         "messageId": str(message.id),
@@ -224,7 +382,6 @@ async def on_message(message) -> None:
     }
 
     key = (int(message.channel.id), int(author.id))
-    now = time.monotonic()
     if AUTO_REPLY_COOLDOWN_SECONDS and now - _last_reply_at[key] < AUTO_REPLY_COOLDOWN_SECONDS:
         auto_reply_stats["skippedCooldown"] += 1
         return
@@ -238,7 +395,6 @@ async def on_message(message) -> None:
         _recent_bot_replies.append(reply)
         auto_reply_stats["replied"] += 1
         auto_reply_stats["lastReplyAt"] = time.time()
-        auto_reply_stats["lastModelError"] = None
         print(
             f"[AutoReply] replied guild={guild.id} channel={message.channel.id} author={author.id} trigger={trigger} replyId={sent.id}",
             flush=True,
@@ -256,6 +412,7 @@ async def auto_reply_status() -> dict[str, Any]:
         "triggers": AUTO_REPLY_TRIGGERS,
         "mentionTrigger": True,
         "cooldownSeconds": AUTO_REPLY_COOLDOWN_SECONDS,
+        "duplicateWindowSeconds": AUTO_REPLY_DUPLICATE_WINDOW_SECONDS,
         "maxContextMessages": AUTO_REPLY_MAX_CONTEXT,
         "contextCharBudget": AUTO_REPLY_CONTEXT_CHARS,
         "model": GROQ_AUTO_REPLY_MODEL if base.GROQ_API_KEY else None,
