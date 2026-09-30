@@ -6,7 +6,7 @@
   "description": "Personal Discord bridge using discord.py-self with MCP support for ChatGPT",
   "main": "src/index.js",
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/launcher.js"
   },
   "engines": {
     "node": ">=24"
