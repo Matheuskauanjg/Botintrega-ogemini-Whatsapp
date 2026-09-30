@@ -18,13 +18,15 @@ client = base.client
 
 AUTO_REPLY_ENABLED = os.getenv("AUTO_REPLY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 AUTO_REPLY_GUILD_ID = os.getenv("AUTO_REPLY_GUILD_ID", "1251266361569710222").strip()
+AUTO_REPLY_CHANNEL_ID = os.getenv("AUTO_REPLY_CHANNEL_ID", "1251266362014302248").strip()
 AUTO_REPLY_TRIGGERS = [
     item.casefold().strip()
     for item in os.getenv("AUTO_REPLY_TRIGGERS", "grade,greed").split(",")
     if item.strip()
 ]
 AUTO_REPLY_COOLDOWN_SECONDS = max(0.0, float(os.getenv("AUTO_REPLY_COOLDOWN_SECONDS", "5")))
-AUTO_REPLY_MAX_CONTEXT = max(1, min(15, int(os.getenv("AUTO_REPLY_MAX_CONTEXT", "8"))))
+AUTO_REPLY_MAX_CONTEXT = max(1, min(100, int(os.getenv("AUTO_REPLY_MAX_CONTEXT", "60"))))
+AUTO_REPLY_CONTEXT_CHARS = max(1500, min(24000, int(os.getenv("AUTO_REPLY_CONTEXT_CHARS", "12000"))))
 AUTO_REPLY_MAX_CHARS = max(50, min(1500, int(os.getenv("AUTO_REPLY_MAX_CHARS", "450"))))
 GROQ_AUTO_REPLY_MODEL = os.getenv("GROQ_AUTO_REPLY_MODEL", "openai/gpt-oss-120b").strip()
 
@@ -34,6 +36,7 @@ auto_reply_stats: dict[str, Any] = {
     "matched": 0,
     "replied": 0,
     "skippedCooldown": 0,
+    "skippedChannel": 0,
     "groqFailures": 0,
     "lastTrigger": None,
     "lastReplyAt": None,
@@ -95,15 +98,21 @@ def _fallback_reply(message, trigger: str | None) -> str:
 
 async def _recent_context(message) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
+    used_chars = 0
     try:
-        async for item in message.channel.history(limit=AUTO_REPLY_MAX_CONTEXT + 2):
+        async for item in message.channel.history(limit=AUTO_REPLY_MAX_CONTEXT + 4):
             if item.id == message.id:
                 continue
             text = (item.content or "").strip()
             if not text:
                 continue
+            text = text[:600]
             name = getattr(item.author, "display_name", None) or getattr(item.author, "name", "alguém")
-            rows.append({"name": str(name), "content": text[:600]})
+            row_cost = len(str(name)) + len(text) + 4
+            if rows and used_chars + row_cost > AUTO_REPLY_CONTEXT_CHARS:
+                break
+            rows.append({"name": str(name), "content": text})
+            used_chars += row_cost
             if len(rows) >= AUTO_REPLY_MAX_CONTEXT:
                 break
     except Exception:
@@ -126,7 +135,8 @@ async def _generate_reply(message, trigger: str | None) -> str:
         f"Servidor Discord: {getattr(getattr(message.channel, 'guild', None), 'name', '')}\n"
         f"Canal: {getattr(message.channel, 'name', str(message.channel.id))}\n"
         f"Gatilho detectado: {trigger or 'menção'}\n"
-        f"Contexto recente, do mais antigo para o mais novo:\n{context_text or '(sem contexto)'}\n\n"
+        f"Conversa recente do canal, incluindo mensagens que não marcaram você, do mais antigo para o mais novo:\n"
+        f"{context_text or '(sem contexto)'}\n\n"
         f"Respostas recentes que VOCÊ já deu e deve evitar repetir:\n{recent_replies}\n\n"
         f"Mensagem atual de {author_name}: {content or '(somente menção)'}"
     )
@@ -141,10 +151,10 @@ async def _generate_reply(message, trigger: str | None) -> str:
                 "content": (
                     "Você está conversando no Discord pela conta Greed. "
                     "Fale em português do Brasil de forma curta, espontânea e informal, como alguém do grupo. "
-                    "A mensagem atual é o foco principal: responda ao que a pessoa realmente perguntou ou falou. "
+                    "A mensagem atual é o foco principal, mas entenda toda a conversa recente fornecida antes de responder. "
+                    "Mensagens sem menção também fazem parte do contexto e podem explicar piadas, assunto e continuidade. "
                     "Se houver uma pergunta, responda a pergunta; não responda apenas 'chamou?'. "
                     "Se for só uma menção sem assunto, pode perguntar o que a pessoa quer, mas varie a frase. "
-                    "Use o histórico recente para entender piadas e continuidade da conversa. "
                     "Nunca copie uma das respostas recentes listadas no prompt e evite bordões repetidos. "
                     "Pode usar risadas como kkk/KKKK e emoji ocasionalmente, sem exagerar. "
                     "Use normalmente 1 frase curta, no máximo 2. "
@@ -196,6 +206,11 @@ async def on_message(message) -> None:
     if guild is None or str(getattr(guild, "id", "")) != AUTO_REPLY_GUILD_ID:
         return
 
+    channel_id = str(getattr(getattr(message, "channel", None), "id", ""))
+    if AUTO_REPLY_CHANNEL_ID and channel_id != AUTO_REPLY_CHANNEL_ID:
+        auto_reply_stats["skippedChannel"] += 1
+        return
+
     matched, trigger = _trigger_match(message)
     if not matched:
         return
@@ -203,7 +218,7 @@ async def on_message(message) -> None:
     auto_reply_stats["matched"] += 1
     auto_reply_stats["lastTrigger"] = {
         "messageId": str(message.id),
-        "channelId": str(message.channel.id),
+        "channelId": channel_id,
         "authorId": str(author.id),
         "trigger": trigger,
     }
@@ -237,9 +252,12 @@ async def auto_reply_status() -> dict[str, Any]:
     return {
         "enabled": AUTO_REPLY_ENABLED,
         "guildId": AUTO_REPLY_GUILD_ID,
+        "channelId": AUTO_REPLY_CHANNEL_ID,
         "triggers": AUTO_REPLY_TRIGGERS,
         "mentionTrigger": True,
         "cooldownSeconds": AUTO_REPLY_COOLDOWN_SECONDS,
+        "maxContextMessages": AUTO_REPLY_MAX_CONTEXT,
+        "contextCharBudget": AUTO_REPLY_CONTEXT_CHARS,
         "model": GROQ_AUTO_REPLY_MODEL if base.GROQ_API_KEY else None,
         "groqConfigured": bool(base.GROQ_API_KEY),
         "recentReplies": list(_recent_bot_replies),
