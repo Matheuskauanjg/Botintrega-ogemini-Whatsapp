@@ -14,6 +14,7 @@ COMMAND_GUILD_ID = os.getenv(
     "G_COMMAND_GUILD_ID",
     os.getenv("AUTO_REPLY_GUILD_ID", "1251266361569710222"),
 ).strip()
+COMMAND_CHANNEL_ID = os.getenv("G_COMMAND_CHANNEL_ID", "1554920170659774545").strip()
 DEFAULT_VOICE_CHANNEL_ID = os.getenv("DEFAULT_VOICE_CHANNEL_ID", "1530374141625106522").strip()
 
 
@@ -31,6 +32,7 @@ def _rewrite_help(result: dict[str, Any]) -> dict[str, Any]:
         }
     result["prefix"] = PREFIX
     result["usage"] = "!g <comando>"
+    result["channelId"] = COMMAND_CHANNEL_ID
     return result
 
 
@@ -178,6 +180,10 @@ async def on_message(message: Any) -> None:
     if COMMAND_GUILD_ID and (guild is None or str(getattr(guild, "id", "")) != COMMAND_GUILD_ID):
         return
 
+    message_channel_id = str(getattr(getattr(message, "channel", None), "id", ""))
+    if COMMAND_CHANNEL_ID and message_channel_id != COMMAND_CHANNEL_ID:
+        return
+
     target = _voice_target_for_message(message)
     body = base.SendMessageBody(to=f"voice:{target}", message=content)
 
@@ -193,7 +199,7 @@ async def on_message(message: Any) -> None:
         await message.channel.send(reply_text[:1800], reference=message, mention_author=False)
 
         print(
-            f"[GCommand] executed guild={getattr(guild, 'id', None)} channel={getattr(message.channel, 'id', None)} command={content!r} targetVoice={target}",
+            f"[GCommand] executed guild={getattr(guild, 'id', None)} channel={message_channel_id} command={content!r} targetVoice={target}",
             flush=True,
         )
     except Exception as exc:
