@@ -44,19 +44,19 @@ def _copy_body_with_message(body: Any, message: str) -> Any:
 
 
 def _voice_target_for_message(message: Any) -> str:
-    """Prefer the current active call, then the author's call, then the configured default."""
-    vc = getattr(voice, "active_voice_client", None)
-    active_channel = getattr(vc, "channel", None) if vc else None
-    active_id = getattr(active_channel, "id", None)
-    if active_id:
-        return str(active_id)
-
+    """Prefer the owner's current call, then an already-active call, then the configured default."""
     author = getattr(message, "author", None)
     voice_state = getattr(author, "voice", None)
     author_channel = getattr(voice_state, "channel", None) if voice_state else None
     author_channel_id = getattr(author_channel, "id", None)
     if author_channel_id:
         return str(author_channel_id)
+
+    vc = getattr(voice, "active_voice_client", None)
+    active_channel = getattr(vc, "channel", None) if vc else None
+    active_id = getattr(active_channel, "id", None)
+    if active_id:
+        return str(active_id)
 
     return DEFAULT_VOICE_CHANNEL_ID
 
@@ -71,6 +71,35 @@ def _help_text(result: dict[str, Any]) -> str:
     if not names:
         return "Use `!g help` para ver os comandos."
     return "**Comandos Greed:**\n" + " • ".join(names)[:1800]
+
+
+def _feedback_text(command_text: str, result: dict[str, Any], target: str) -> str:
+    command = (result.get("command") or command_text.split(maxsplit=1)[0] or "comando").strip()
+    text = result.get("text")
+    if text:
+        return str(text)[:1700]
+
+    if command == "coin":
+        value = result.get("result")
+        return f"🪙 Deu **{value}**. Áudio enviado para a call `{target}`." if value else f"🪙 Moeda jogada. Call `{target}`."
+    if command == "dice":
+        value = result.get("result")
+        sides = result.get("sides")
+        return f"🎲 d{sides}: **{value}**. Áudio enviado para a call `{target}`."
+    if command == "choose":
+        return f"🎯 Escolhi **{result.get('chosen')}**. Áudio enviado para a call `{target}`."
+    if command == "8ball":
+        return f"🎱 {result.get('answer', 'Respondido')}. Call `{target}`."
+    if command in {"say", "repeat", "mock", "countdown", "ask"}:
+        return f"🔊 `{PREFIX} {command}` executado na call `{target}`."
+    if command in {"sound", "randomsound"} or result.get("mode") == "soundboard":
+        sound = result.get("sound") or "efeito"
+        return f"🔊 Som **{sound}** tocado na call `{target}`."
+    if command in {"play", "search", "pause", "resume", "skip", "stop", "queue", "nowplaying"}:
+        return f"🎵 `{PREFIX} {command}` executado na call `{target}`."
+    if command in {"join", "leave"}:
+        return f"🎙️ `{PREFIX} {command}` executado para a call `{target}`."
+    return f"✅ `{PREFIX} {command_text}` executado. Call `{target}`."
 
 
 async def _execute_prefixed_voice_command(body: Any) -> dict[str, Any]:
@@ -98,8 +127,6 @@ async def _execute_prefixed_voice_command(body: Any) -> dict[str, Any]:
     return result
 
 
-# Capture the currently active /api/send endpoint from bridge_fun, then replace it
-# with a thin prefix adapter. This keeps all existing command implementations intact.
 _previous_send_handler = None
 for route in list(app.router.routes):
     if getattr(route, "path", None) == "/api/send" and "POST" in (getattr(route, "methods", set()) or set()):
@@ -120,7 +147,6 @@ async def send_message_with_g_prefix(body: Any) -> dict[str, Any]:
     if message.casefold() == PREFIX or message.casefold().startswith(f"{PREFIX} "):
         return await _execute_prefixed_voice_command(body)
 
-    # Commands no longer use /cmd or !cmd. Plain speech still goes through to TTS.
     if message.startswith("/") or message.startswith("!"):
         raise voice.HTTPException(
             status_code=400,
@@ -130,8 +156,6 @@ async def send_message_with_g_prefix(body: Any) -> dict[str, Any]:
     return await _previous_send_handler(body)
 
 
-# bridge_auto registered an on_message handler before this module was imported.
-# Keep it for normal auto-replies, while intercepting !g messages typed by the account itself.
 _previous_on_message = client.on_message
 
 
@@ -145,7 +169,6 @@ async def on_message(message: Any) -> None:
         await _previous_on_message(message)
         return
 
-    # Direct Discord commands are owner-only: only the logged-in account can execute them.
     me = client.user
     author = getattr(message, "author", None)
     if me is None or author is None or getattr(author, "id", None) != getattr(me, "id", None):
@@ -162,14 +185,12 @@ async def on_message(message: Any) -> None:
         result = await _execute_prefixed_voice_command(body)
         command_text = content[len(PREFIX):].strip().casefold() if len(content) > len(PREFIX) else "help"
 
-        # Help/status-like commands get a visible chat response; audio commands run silently in chat.
         if command_text in {"", "help", "ajuda"}:
-            await message.channel.send(_help_text(result), reference=message, mention_author=False)
-        elif command_text.startswith(("status", "ping", "uptime", "whoami", "channel", "members", "queue", "nowplaying")):
-            text = result.get("text")
-            if not text:
-                text = f"✅ `{PREFIX} {command_text}` executado."
-            await message.channel.send(str(text)[:1800], reference=message, mention_author=False)
+            reply_text = _help_text(result)
+        else:
+            reply_text = _feedback_text(command_text, result, target)
+
+        await message.channel.send(reply_text[:1800], reference=message, mention_author=False)
 
         print(
             f"[GCommand] executed guild={getattr(guild, 'id', None)} channel={getattr(message.channel, 'id', None)} command={content!r} targetVoice={target}",
