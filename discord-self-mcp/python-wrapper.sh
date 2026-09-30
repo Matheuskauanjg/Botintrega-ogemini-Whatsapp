@@ -1,2 +1,2 @@
 #!/bin/sh
-exec /opt/venv/bin/python -m uvicorn bridge_gprefix:app --host 127.0.0.1 --port "${BRIDGE_INTERNAL_PORT:-10001}"
+exec /opt/venv/bin/python -m uvicorn bridge_gemini:app --host 127.0.0.1 --port "${BRIDGE_INTERNAL_PORT:-10001}"
