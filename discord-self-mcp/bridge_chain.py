@@ -1,4 +1,12 @@
+import asyncio
+import os
+import sqlite3
+import time
+from pathlib import Path
 from typing import Any
+
+import httpx
+from fastapi import Depends
 
 import bridge_gprefix as stack
 
@@ -6,16 +14,387 @@ app = stack.app
 fun = stack.fun
 auto = fun.auto
 base = auto.base
+client = auto.client
 
 # Save the original Groq handlers before bridge_gemini replaces them.
 _original_auto_generate = auto._generate_reply
 _original_ask_groq = fun._ask_groq
+_original_recent_context = auto._recent_context
 
 import bridge_gemini as gemini  # noqa: E402
 
+# ---------------------------------------------------------------------------
+# Persistent conversation context
+# ---------------------------------------------------------------------------
+CONTEXT_DB_PATH = os.getenv("CONTEXT_DB_PATH", "/data/discord_context.sqlite3").strip()
+CONTEXT_RETENTION_DAYS = max(1, int(os.getenv("CONTEXT_RETENTION_DAYS", "90")))
+CONTEXT_MAX_ROWS_PER_CHANNEL = max(500, int(os.getenv("CONTEXT_MAX_ROWS_PER_CHANNEL", "20000")))
+CONTEXT_PROMPT_MESSAGES = max(10, min(200, int(os.getenv("CONTEXT_PROMPT_MESSAGES", "80"))))
+CONTEXT_PROMPT_CHARS = max(2000, min(50000, int(os.getenv("CONTEXT_PROMPT_CHARS", "18000"))))
+
+_default_context_channels = [
+    os.getenv("AUTO_REPLY_CHANNEL_ID", "1554920683786739712").strip(),
+    os.getenv("G_COMMAND_CHANNEL_ID", "1554920170659774545").strip(),
+]
+CONTEXT_CHANNEL_IDS = {
+    item.strip()
+    for item in os.getenv("CONTEXT_CHANNEL_IDS", ",".join(_default_context_channels)).split(",")
+    if item.strip()
+}
+
+
+def _open_context_db() -> sqlite3.Connection:
+    path = Path(CONTEXT_DB_PATH)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        path = Path("/tmp/discord_context.sqlite3")
+        path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS messages (
+            message_id TEXT PRIMARY KEY,
+            guild_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            author_id TEXT NOT NULL,
+            author_name TEXT NOT NULL,
+            content TEXT NOT NULL,
+            reply_to_message_id TEXT,
+            is_self INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_channel_time ON messages(channel_id, created_at DESC)"
+    )
+    conn.commit()
+    return conn
+
+
+def _store_row_sync(row: dict[str, Any]) -> None:
+    if not row.get("message_id") or not row.get("channel_id"):
+        return
+    with _open_context_db() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO messages (
+                message_id, guild_id, channel_id, author_id, author_name,
+                content, reply_to_message_id, is_self, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["message_id"],
+                row.get("guild_id", ""),
+                row["channel_id"],
+                row.get("author_id", ""),
+                row.get("author_name", "alguém"),
+                row.get("content", "")[:4000],
+                row.get("reply_to_message_id"),
+                1 if row.get("is_self") else 0,
+                float(row.get("created_at") or time.time()),
+            ),
+        )
+        cutoff = time.time() - CONTEXT_RETENTION_DAYS * 86400
+        conn.execute("DELETE FROM messages WHERE created_at < ?", (cutoff,))
+        conn.execute(
+            """
+            DELETE FROM messages
+            WHERE channel_id = ? AND message_id NOT IN (
+                SELECT message_id FROM messages
+                WHERE channel_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            )
+            """,
+            (row["channel_id"], row["channel_id"], CONTEXT_MAX_ROWS_PER_CHANNEL),
+        )
+        conn.commit()
+
+
+def _message_to_row(message: Any) -> dict[str, Any] | None:
+    channel = getattr(message, "channel", None)
+    channel_id = str(getattr(channel, "id", ""))
+    if not channel_id or channel_id not in CONTEXT_CHANNEL_IDS:
+        return None
+    guild = getattr(message, "guild", None) or getattr(channel, "guild", None)
+    if auto.AUTO_REPLY_GUILD_ID and str(getattr(guild, "id", "")) != auto.AUTO_REPLY_GUILD_ID:
+        return None
+    author = getattr(message, "author", None)
+    if author is None:
+        return None
+    content = str(getattr(message, "content", "") or "").strip()
+    attachments = getattr(message, "attachments", None) or []
+    if attachments:
+        attachment_names = [str(getattr(item, "filename", "arquivo")) for item in attachments[:5]]
+        suffix = " [anexos: " + ", ".join(attachment_names) + "]"
+        content = (content + suffix).strip()
+    if not content:
+        return None
+    reference = getattr(message, "reference", None)
+    created_at = getattr(message, "created_at", None)
+    timestamp = created_at.timestamp() if created_at is not None else time.time()
+    return {
+        "message_id": str(getattr(message, "id", "")),
+        "guild_id": str(getattr(guild, "id", "")),
+        "channel_id": channel_id,
+        "author_id": str(getattr(author, "id", "")),
+        "author_name": str(getattr(author, "display_name", None) or getattr(author, "name", "alguém")),
+        "content": content,
+        "reply_to_message_id": str(getattr(reference, "message_id", "")) or None,
+        "is_self": bool(client.user is not None and getattr(author, "id", None) == getattr(client.user, "id", None)),
+        "created_at": timestamp,
+    }
+
+
+async def _store_message(message: Any) -> None:
+    row = _message_to_row(message)
+    if row is not None:
+        await asyncio.to_thread(_store_row_sync, row)
+
+
+def _load_context_sync(channel_id: str, limit: int, char_budget: int) -> list[dict[str, str]]:
+    with _open_context_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT author_name, content
+            FROM messages
+            WHERE channel_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (channel_id, limit * 2),
+        ).fetchall()
+    rows.reverse()
+    selected: list[dict[str, str]] = []
+    used = 0
+    for author_name, content in rows:
+        text = str(content or "")[:1200]
+        cost = len(str(author_name)) + len(text) + 4
+        if selected and used + cost > char_budget:
+            continue
+        selected.append({"name": str(author_name), "content": text})
+        used += cost
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+async def _persistent_recent_context(message: Any) -> list[dict[str, str]]:
+    # Seed the DB with Discord history so a fresh volume immediately has useful context.
+    try:
+        seed = await _original_recent_context(message)
+        channel_id = str(getattr(getattr(message, "channel", None), "id", ""))
+        guild_id = str(getattr(getattr(message, "guild", None), "id", ""))
+        base_time = time.time() - max(1, len(seed))
+        for index, row in enumerate(seed):
+            pseudo_id = f"seed:{channel_id}:{int(base_time)}:{index}:{hash((row.get('name'), row.get('content')))}"
+            await asyncio.to_thread(
+                _store_row_sync,
+                {
+                    "message_id": pseudo_id,
+                    "guild_id": guild_id,
+                    "channel_id": channel_id,
+                    "author_id": "seed",
+                    "author_name": row.get("name", "alguém"),
+                    "content": row.get("content", ""),
+                    "created_at": base_time + index,
+                },
+            )
+    except Exception as exc:
+        print(f"[Context] seed failed: {type(exc).__name__}: {exc}", flush=True)
+
+    channel_id = str(getattr(getattr(message, "channel", None), "id", ""))
+    return await asyncio.to_thread(
+        _load_context_sync,
+        channel_id,
+        CONTEXT_PROMPT_MESSAGES,
+        CONTEXT_PROMPT_CHARS,
+    )
+
+
+auto._recent_context = _persistent_recent_context
+
+# Persist every message seen in the selected context channels, then continue the
+# existing !g / auto-reply message handlers.
+_previous_on_message_chain = client.on_message
+
+
+@client.event
+async def on_message(message: Any) -> None:
+    try:
+        await _store_message(message)
+    except Exception as exc:
+        print(f"[Context] store failed: {type(exc).__name__}: {exc}", flush=True)
+    await _previous_on_message_chain(message)
+
+
+# ---------------------------------------------------------------------------
+# Provider/model failover chain
+# ---------------------------------------------------------------------------
+GEMINI_API_KEY_1 = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_API_KEY_2 = os.getenv("GEMINI_API_KEY_2", "").strip()
+GEMINI_API_BASE = os.getenv(
+    "GEMINI_API_BASE", "https://generativelanguage.googleapis.com/v1beta"
+).rstrip("/")
+
+_DEFAULT_MODELS = [
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite",
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+]
+
+
+def _parse_models(env_name: str) -> list[str]:
+    raw = os.getenv(env_name, "").strip()
+    if not raw:
+        return list(_DEFAULT_MODELS)
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+GEMINI_MODELS_1 = _parse_models("GEMINI_MODELS_1")
+GEMINI_MODELS_2 = _parse_models("GEMINI_MODELS_2")
+
+# provider:model -> monotonic timestamp when it may be tried again.
+_model_cooldowns: dict[str, float] = {}
+
+
+class GeminiRequestError(RuntimeError):
+    def __init__(self, status: int, message: str = "") -> None:
+        super().__init__(f"Gemini HTTP {status}{(': ' + message) if message else ''}")
+        self.status = status
+
+
+def _set_model_cooldown(provider: str, model: str, status: int) -> None:
+    if status == 429:
+        seconds = 3600
+    elif status in {400, 403, 404}:
+        seconds = 21600
+    elif status in {500, 502, 503, 504}:
+        seconds = 20
+    else:
+        seconds = 60
+    _model_cooldowns[f"{provider}:{model}"] = time.monotonic() + seconds
+
+
+def _model_available(provider: str, model: str) -> bool:
+    return time.monotonic() >= _model_cooldowns.get(f"{provider}:{model}", 0.0)
+
+
+async def _gemini_text_with_key(
+    api_key: str,
+    model: str,
+    prompt: str,
+    system: str,
+    max_output_tokens: int = 220,
+) -> str:
+    url = f"{GEMINI_API_BASE}/models/{model}:generateContent"
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": f"INSTRUÇÕES:\n{system}\n\nCONTEÚDO:\n{prompt}"}],
+            }
+        ],
+        "generationConfig": {"maxOutputTokens": max_output_tokens},
+    }
+    async with httpx.AsyncClient(timeout=30) as http:
+        response = await http.post(
+            url,
+            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+            json=payload,
+        )
+    if response.is_error:
+        reason = ""
+        try:
+            body = response.json()
+            reason = str(((body.get("error") or {}).get("status") or ""))[:80]
+        except Exception:
+            pass
+        raise GeminiRequestError(response.status_code, reason)
+    data = response.json()
+    candidates = data.get("candidates") or []
+    if not candidates:
+        raise GeminiRequestError(502, "empty_candidate")
+    parts = (((candidates[0] or {}).get("content") or {}).get("parts") or [])
+    text = " ".join(str(part.get("text", "")).strip() for part in parts if part.get("text")).strip()
+    if not text:
+        raise GeminiRequestError(502, "empty_text")
+    return " ".join(text.split())
+
+
+def _build_auto_prompt(message: Any, trigger: str | None, context: list[dict[str, str]]) -> tuple[str, str]:
+    author_name = getattr(message.author, "display_name", None) or getattr(message.author, "name", "alguém")
+    content = (message.content or "").strip()
+    context_text = "\n".join(f"{row['name']}: {row['content']}" for row in context)
+    recent_replies = "\n".join(f"- {item}" for item in auto._recent_bot_replies) or "(nenhuma)"
+    prompt = (
+        f"Servidor Discord: {getattr(getattr(message.channel, 'guild', None), 'name', '')}\n"
+        f"Canal: {getattr(message.channel, 'name', str(message.channel.id))}\n"
+        f"Gatilho detectado: {trigger or 'menção'}\n"
+        f"Histórico persistido da conversa, do mais antigo para o mais novo:\n"
+        f"{context_text or '(sem contexto)'}\n\n"
+        f"Respostas recentes que você já deu e deve evitar repetir:\n{recent_replies}\n\n"
+        f"Mensagem atual de {author_name}: {content or '(somente menção)'}"
+    )
+    system = (
+        "Você está conversando no Discord pela conta Greed. "
+        "Responda em português do Brasil de forma curta, espontânea e informal, como alguém do grupo. "
+        "Use o histórico persistido para manter continuidade, entender referências, números anteriores, piadas e assunto. "
+        "Se houver pergunta factual ou matemática, responda corretamente e diretamente antes de brincar. "
+        "Se a pessoa disser 'esse número', 'isso', 'agora multiplica', 'o anterior' ou similares, resolva pelo histórico. "
+        "Não repita bordões ou respostas recentes. Pode usar kkk/KKKK e emoji ocasionalmente, sem exagerar. "
+        "Use normalmente uma frase curta, no máximo duas. "
+        "Não diga que é IA, bot ou resposta automática. "
+        "Não invente fatos pessoais, não revele credenciais/tokens/segredos e não faça ameaças reais."
+    )
+    return prompt, system
+
+
+async def _try_gemini_provider(
+    provider: str,
+    api_key: str,
+    models: list[str],
+    prompt: str,
+    system: str,
+    max_output_tokens: int,
+) -> tuple[str, str] | None:
+    if not api_key:
+        return None
+    for model in models:
+        if not _model_available(provider, model):
+            continue
+        try:
+            text = await _gemini_text_with_key(api_key, model, prompt, system, max_output_tokens)
+            auto.auto_reply_stats["provider"] = provider
+            auto.auto_reply_stats["providerModel"] = model
+            auto.auto_reply_stats[f"{provider}Replies"] = int(auto.auto_reply_stats.get(f"{provider}Replies", 0)) + 1
+            auto.auto_reply_stats["lastModelError"] = None
+            print(f"[ProviderChain] success provider={provider} model={model}", flush=True)
+            return text, model
+        except GeminiRequestError as exc:
+            _set_model_cooldown(provider, model, exc.status)
+            auto.auto_reply_stats[f"{provider}Failures"] = int(auto.auto_reply_stats.get(f"{provider}Failures", 0)) + 1
+            auto.auto_reply_stats["lastModelError"] = f"{provider}/{model}: HTTP {exc.status}"[:700]
+            print(f"[ProviderChain] fail provider={provider} model={model} status={exc.status}; next model", flush=True)
+        except Exception as exc:
+            _set_model_cooldown(provider, model, 500)
+            auto.auto_reply_stats[f"{provider}Failures"] = int(auto.auto_reply_stats.get(f"{provider}Failures", 0)) + 1
+            print(f"[ProviderChain] fail provider={provider} model={model} error={type(exc).__name__}; next model", flush=True)
+    return None
+
 
 async def _auto_reply_chain(message: Any, trigger: str | None) -> str:
-    """Provider order: Groq -> Gemini -> local smart fallback."""
+    """Provider order: Groq -> Gemini key 1 models -> Gemini key 2 models -> local."""
     context = await auto._recent_context(message)
 
     if base.GROQ_API_KEY:
@@ -24,30 +403,92 @@ async def _auto_reply_chain(message: Any, trigger: str | None) -> str:
         failures_after = int(auto.auto_reply_stats.get("groqFailures", 0))
         if failures_after == failures_before:
             auto.auto_reply_stats["provider"] = "groq"
+            auto.auto_reply_stats["providerModel"] = auto.GROQ_AUTO_REPLY_MODEL
             return reply
-        print("[AutoReply] Groq falhou; tentando Gemini", flush=True)
+        print("[ProviderChain] Groq falhou; tentando Gemini 1", flush=True)
 
-    # bridge_gemini already performs Gemini -> local fallback.
-    reply = await gemini._generate_auto_reply(message, trigger)
-    provider = "gemini" if gemini.GEMINI_API_KEY else "local"
-    auto.auto_reply_stats["provider"] = provider
-    return reply
+    prompt, system = _build_auto_prompt(message, trigger, context)
+
+    result = await _try_gemini_provider(
+        "gemini1", GEMINI_API_KEY_1, GEMINI_MODELS_1, prompt, system, 220
+    )
+    if result is not None:
+        reply = result[0][: auto.AUTO_REPLY_MAX_CHARS]
+        if reply not in auto._recent_bot_replies:
+            return reply
+
+    print("[ProviderChain] Gemini 1 indisponível; tentando Gemini 2", flush=True)
+    result = await _try_gemini_provider(
+        "gemini2", GEMINI_API_KEY_2, GEMINI_MODELS_2, prompt, system, 220
+    )
+    if result is not None:
+        reply = result[0][: auto.AUTO_REPLY_MAX_CHARS]
+        if reply not in auto._recent_bot_replies:
+            return reply
+
+    auto.auto_reply_stats["provider"] = "local"
+    auto.auto_reply_stats["providerModel"] = None
+    auto.auto_reply_stats["smartFallbacks"] = int(auto.auto_reply_stats.get("smartFallbacks", 0)) + 1
+    return auto._smart_fallback_reply(message, trigger, context)
 
 
 async def _ask_chain(prompt: str) -> str:
-    """Provider order for !g ask: Groq -> Gemini."""
+    """Provider order for !g ask: Groq -> Gemini 1 models -> Gemini 2 models -> local message."""
     if base.GROQ_API_KEY:
         try:
             return await _original_ask_groq(prompt)
         except Exception as exc:
-            print(f"[GCommand] Groq falhou; tentando Gemini: {type(exc).__name__}", flush=True)
+            print(f"[GCommand] Groq falhou; tentando Gemini 1: {type(exc).__name__}", flush=True)
 
-    return await gemini._ask_gemini(prompt)
+    system = (
+        "Responda em português do Brasil para ser falado em uma call do Discord. "
+        "Seja direto, natural e curto: normalmente uma ou duas frases. "
+        "Se for matemática ou pergunta factual, responda corretamente antes de qualquer brincadeira. "
+        "Não revele credenciais, tokens ou segredos e não faça ameaças reais."
+    )
+    result = await _try_gemini_provider(
+        "gemini1", GEMINI_API_KEY_1, GEMINI_MODELS_1, prompt[:1800], system, 220
+    )
+    if result is not None:
+        return result[0][:700]
+
+    result = await _try_gemini_provider(
+        "gemini2", GEMINI_API_KEY_2, GEMINI_MODELS_2, prompt[:1800], system, 220
+    )
+    if result is not None:
+        return result[0][:700]
+
+    return "As IAs externas estão indisponíveis agora. O fallback local continua ativo para a resposta automática."
 
 
 auto._generate_reply = _auto_reply_chain
 fun._ask_groq = _ask_chain
 
-auto.auto_reply_stats["providerOrder"] = ["groq", "gemini", "local"]
-auto.auto_reply_stats["geminiConfigured"] = bool(gemini.GEMINI_API_KEY)
-auto.auto_reply_stats["geminiModel"] = gemini.GEMINI_MODEL
+auto.auto_reply_stats["providerOrder"] = ["groq", "gemini1", "gemini2", "local"]
+auto.auto_reply_stats["gemini1Configured"] = bool(GEMINI_API_KEY_1)
+auto.auto_reply_stats["gemini2Configured"] = bool(GEMINI_API_KEY_2)
+auto.auto_reply_stats["geminiModels1"] = GEMINI_MODELS_1
+auto.auto_reply_stats["geminiModels2"] = GEMINI_MODELS_2
+auto.auto_reply_stats["contextDbPath"] = CONTEXT_DB_PATH
+auto.auto_reply_stats["contextChannels"] = sorted(CONTEXT_CHANNEL_IDS)
+
+
+@app.get("/api/context/status", dependencies=[Depends(base.require_api_token)])
+async def context_status() -> dict[str, Any]:
+    def stats() -> dict[str, Any]:
+        with _open_context_db() as conn:
+            total = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            channels = conn.execute(
+                "SELECT channel_id, COUNT(*) FROM messages GROUP BY channel_id ORDER BY COUNT(*) DESC"
+            ).fetchall()
+        return {
+            "path": CONTEXT_DB_PATH,
+            "totalMessages": total,
+            "channels": [{"channelId": row[0], "messages": row[1]} for row in channels],
+            "retentionDays": CONTEXT_RETENTION_DAYS,
+            "maxRowsPerChannel": CONTEXT_MAX_ROWS_PER_CHANNEL,
+            "promptMessages": CONTEXT_PROMPT_MESSAGES,
+            "promptChars": CONTEXT_PROMPT_CHARS,
+        }
+
+    return await asyncio.to_thread(stats)
