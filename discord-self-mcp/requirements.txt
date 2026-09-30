@@ -1,4 +1,4 @@
-discord.py-self[voice] @ https://github.com/dolfies/discord.py-self/archive/2ba64a9a997e151a9c259984e0a179b1fdf4aff4.zip
+discord.py-self[voice]>=2.1.0,<3
 fastapi>=0.116,<1
 uvicorn[standard]>=0.35,<1
 httpx>=0.28,<1
