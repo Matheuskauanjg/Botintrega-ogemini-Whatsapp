@@ -256,7 +256,11 @@ def _smart_fallback_reply(message, trigger: str | None, context: list[dict[str, 
     if any(insult in normalized for insult in ("vai tomar no cu", "va tomar no cu", "seu cu", "fdp", "filho da puta")):
         if "derivada" in " ".join(row.get("content", "").casefold() for row in context[-8:]):
             return f"KKKKKK calma {author_name}, a derivada te estressou foi?"
-        return f"KKKKKK qual foi {author_name} 💀"
+        return random.choice([
+            f"KKKKKK {author_name}, tu veio me xingar e trouxe só isso? 💀",
+            f"{author_name} acordou e escolheu passar vergonha no chat KKKKK",
+            f"KKKKKK calma {author_name}, guarda um pouco dessa energia pra uma resposta boa",
+        ])
 
     # Generic fallback only after trying to answer the actual content.
     if "?" in cleaned:
@@ -360,12 +364,13 @@ async def _generate_reply(message, trigger: str | None) -> str:
                     "A mensagem atual é o foco principal, mas entenda a conversa recente e as memórias relevantes recuperadas do histórico inteiro antes de responder. "
                     "Mensagens sem menção também fazem parte do contexto e podem explicar piadas, assunto, pessoas e continuidade. "
                     "Não fique preso em assunto antigo quando a conversa já mudou. Memória antiga é contexto, não obrigação de continuar o tema. "
-                    "Se uma pessoa disser que não gostou de uma brincadeira, que algo machucou, ou pedir mudança no modo de falar, trate isso como preferência duradoura daquela mesma pessoa e não repita o padrão depois. "
+                    "O estilo do Greed pode ser zoeiro, sarcástico e provocador. Quando a pessoa estiver claramente entrando na brincadeira, zoando de volta, xingando em tom de meme ou provocando, responda na mesma energia ou um pouco mais forte, com criatividade e usando callbacks do histórico quando ficarem engraçados. Evite ficar pedindo desculpa por qualquer provocação leve. "
+                    "Se houver um pedido claro para parar a zoação, para não falar mais daquele assunto ou para respeitar um limite específico, respeite esse limite. Não use ameaça real, doxxing, chantagem, incentivo a autoagressão nem ataque baseado em característica protegida. "
                     "Se houver uma pergunta factual ou matemática, responda corretamente e diretamente antes de brincar. "
                     "Se a pessoa usar expressões como 'esse número', 'isso', 'agora multiplica' ou similares, resolva a referência usando a conversa recente. "
                     "Se for só uma menção sem assunto, pode perguntar o que a pessoa quer, mas varie a frase. "
                     "Nunca copie uma das respostas recentes listadas no prompt e evite bordões repetidos. "
-                    "Pode usar risadas como kkk/KKKK e emoji ocasionalmente, sem exagerar. "
+                    "Pode usar risadas como kkk/KKKK, deboche, ironia e emoji ocasionalmente. Em conversa de zoeira, prefira uma resposta com punchline em vez de encerrar com 'o que você precisa?' ou tentar mudar para um assunto aleatório. "
                     + (
                         "Quando o pedido envolver código: SEMPRE escreva o código em bloco Markdown cercado por três crases, informando a linguagem, preserve quebras de linha e indentação reais e nunca coloque código multilinha entre crases simples. Se a mensagem atual só mudar a linguagem, como 'quero em python', reutilize o pedido de código imediatamente anterior do histórico e apenas converta/adapte esse mesmo código; não troque por um exemplo genérico. Se pedirem para deixar maior, realmente expanda o programa. Você pode gerar resposta longa; o sistema divide automaticamente em várias mensagens do Discord. "
                         if profile["kind"] == "code"
