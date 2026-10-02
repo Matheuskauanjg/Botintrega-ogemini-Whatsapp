@@ -105,7 +105,20 @@ def _reply_profile(text: str) -> dict[str, Any]:
         "onde ", "passo a passo", "detalhe", "detalha", "analise", "analisa",
         "compare", "compara", "resuma", "resume",
     )
-    wants_code = any(marker in normalized for marker in code_markers)
+    code_actions = (
+        "deixe", "deixa", "aumente", "aumenta", "maior", "melhore", "melhora",
+        "corrija", "corrige", "arrume", "arruma", "complete", "completa",
+        "continue", "continua", "adicione", "adiciona", "expanda", "expande",
+        "converta", "converte", "transforme", "transforma", "reescreva",
+        "otimize", "otimiza", "refatore", "refatora",
+    )
+    mentions_code = bool(re.search(r"\b(?:codigo|code)\b", normalized))
+    looks_like_pasted_code = any(token in text for token in ("```", "def ", "print(", "if ", "elif ", "else:", "return ", "#include", "int main(", "function ", "const ", "let "))
+    wants_code = (
+        any(marker in normalized for marker in code_markers)
+        or (mentions_code and any(action in normalized for action in code_actions))
+        or (looks_like_pasted_code and any(action in normalized for action in code_actions))
+    )
     wants_detail = "?" in text or wants_code or any(marker in normalized for marker in detailed_markers)
 
     if wants_code:
@@ -299,6 +312,10 @@ async def _generate_reply(message, trigger: str | None) -> str:
     content = (message.content or "").strip()
     context = await _recent_context(message)
     profile = _reply_profile(content)
+    print(
+        f"[AutoReply] profile={profile['kind']} max_tokens={profile['max_tokens']} max_chars={profile['max_chars']}",
+        flush=True,
+    )
 
     if not base.GROQ_API_KEY:
         auto_reply_stats["smartFallbacks"] += 1
