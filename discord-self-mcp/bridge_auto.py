@@ -32,7 +32,9 @@ AUTO_REPLY_DUPLICATE_WINDOW_SECONDS = max(0.0, float(os.getenv("AUTO_REPLY_DUPLI
 AUTO_REPLY_MAX_CONTEXT = max(1, min(100, int(os.getenv("AUTO_REPLY_MAX_CONTEXT", "60"))))
 AUTO_REPLY_CONTEXT_CHARS = max(1500, min(24000, int(os.getenv("AUTO_REPLY_CONTEXT_CHARS", "12000"))))
 AUTO_REPLY_MAX_CHARS = max(50, min(1500, int(os.getenv("AUTO_REPLY_MAX_CHARS", "450"))))
-AUTO_REPLY_LONG_MAX_CHARS = max(AUTO_REPLY_MAX_CHARS, min(1900, int(os.getenv("AUTO_REPLY_LONG_MAX_CHARS", "1850"))))
+AUTO_REPLY_DETAIL_MAX_CHARS = max(AUTO_REPLY_MAX_CHARS, min(6000, int(os.getenv("AUTO_REPLY_DETAIL_MAX_CHARS", "4500"))))
+AUTO_REPLY_CODE_MAX_CHARS = max(AUTO_REPLY_DETAIL_MAX_CHARS, min(12000, int(os.getenv("AUTO_REPLY_CODE_MAX_CHARS", "9000"))))
+AUTO_REPLY_LONG_MAX_CHARS = AUTO_REPLY_DETAIL_MAX_CHARS
 AUTO_REPLY_ALLOW_SELF = os.getenv("AUTO_REPLY_ALLOW_SELF", "true").strip().lower() in {"1", "true", "yes", "on"}
 GROQ_AUTO_REPLY_MODEL = os.getenv("GROQ_AUTO_REPLY_MODEL", "openai/gpt-oss-120b").strip()
 
@@ -107,9 +109,9 @@ def _reply_profile(text: str) -> dict[str, Any]:
     wants_detail = "?" in text or wants_code or any(marker in normalized for marker in detailed_markers)
 
     if wants_code:
-        return {"kind": "code", "detailed": True, "max_tokens": 1000, "max_chars": AUTO_REPLY_LONG_MAX_CHARS}
+        return {"kind": "code", "detailed": True, "max_tokens": 2200, "max_chars": AUTO_REPLY_CODE_MAX_CHARS}
     if wants_detail:
-        return {"kind": "detailed", "detailed": True, "max_tokens": 650, "max_chars": AUTO_REPLY_LONG_MAX_CHARS}
+        return {"kind": "detailed", "detailed": True, "max_tokens": 900, "max_chars": AUTO_REPLY_DETAIL_MAX_CHARS}
     return {"kind": "casual", "detailed": False, "max_tokens": 220, "max_chars": AUTO_REPLY_MAX_CHARS}
 
 
@@ -381,6 +383,73 @@ async def _generate_reply(message, trigger: str | None) -> str:
         return _smart_fallback_reply(message, trigger, context)
 
 
+def _split_discord_reply(text: str, limit: int = 1850) -> list[str]:
+    """Split long Discord replies while keeping fenced code valid in every chunk."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+    in_fence = False
+    fence_lang = ""
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        is_fence = stripped.startswith("```")
+        is_closing = bool(is_fence and in_fence)
+        addition = line + "\n"
+        reserve = 4 if in_fence and not is_closing else 0
+
+        if current and len(current) + len(addition) + reserve > limit:
+            if in_fence:
+                # If this line is the model's closing fence, consume it by
+                # closing this chunk rather than opening an empty next fence.
+                chunks.append((current.rstrip() + "\n```").strip())
+                if is_closing:
+                    current = ""
+                    in_fence = False
+                    fence_lang = ""
+                    continue
+                current = f"```{fence_lang}\n"
+            else:
+                chunks.append(current.rstrip())
+                current = ""
+
+        # Extremely long single lines are split as a last resort.
+        while len(current) + len(addition) + (4 if in_fence and not is_closing else 0) > limit:
+            available = max(200, limit - len(current) - (4 if in_fence else 0))
+            piece = addition[:available]
+            addition = addition[available:]
+            current += piece
+            if in_fence:
+                chunks.append((current.rstrip() + "\n```").strip())
+                current = f"```{fence_lang}\n"
+            else:
+                chunks.append(current.rstrip())
+                current = ""
+
+        current += addition
+
+        if is_fence:
+            if in_fence:
+                in_fence = False
+                fence_lang = ""
+            else:
+                in_fence = True
+                fence_lang = stripped[3:].strip()
+
+    if current.strip():
+        if in_fence:
+            current = current.rstrip() + "\n```"
+        chunks.append(current.strip())
+
+    return [chunk for chunk in chunks if chunk]
+
+
 @client.event
 async def on_message(message) -> None:
     if not AUTO_REPLY_ENABLED or client.user is None:
@@ -447,12 +516,24 @@ async def on_message(message) -> None:
 
     try:
         reply = await _generate_reply(message, trigger)
-        _recent_bot_replies.append(reply)
-        sent = await message.channel.send(reply, reference=message, mention_author=False)
+        chunks = _split_discord_reply(reply)
+        if not chunks:
+            raise RuntimeError("empty reply after Discord splitting")
+
+        sent = None
+        for index, chunk in enumerate(chunks):
+            _recent_bot_replies.append(chunk)
+            if index == 0:
+                sent = await message.channel.send(chunk, reference=message, mention_author=False)
+            else:
+                await message.channel.send(chunk)
+                await asyncio.sleep(0.15)
+
         auto_reply_stats["replied"] += 1
         auto_reply_stats["lastReplyAt"] = time.time()
+        auto_reply_stats["lastReplyChunks"] = len(chunks)
         print(
-            f"[AutoReply] replied guild={guild.id} channel={message.channel.id} author={author.id} trigger={trigger} replyId={sent.id}",
+            f"[AutoReply] replied guild={guild.id} channel={message.channel.id} author={author.id} trigger={trigger} replyId={sent.id if sent else 'none'} chunks={len(chunks)}",
             flush=True,
         )
     except Exception as exc:
@@ -473,7 +554,9 @@ async def auto_reply_status() -> dict[str, Any]:
         "maxContextMessages": AUTO_REPLY_MAX_CONTEXT,
         "contextCharBudget": AUTO_REPLY_CONTEXT_CHARS,
         "casualMaxChars": AUTO_REPLY_MAX_CHARS,
-        "longMaxChars": AUTO_REPLY_LONG_MAX_CHARS,
+        "detailMaxChars": AUTO_REPLY_DETAIL_MAX_CHARS,
+        "codeMaxChars": AUTO_REPLY_CODE_MAX_CHARS,
+        "discordChunkChars": 1850,
         "model": GROQ_AUTO_REPLY_MODEL if base.GROQ_API_KEY else None,
         "groqConfigured": bool(base.GROQ_API_KEY),
         "recentReplies": list(_recent_bot_replies),
