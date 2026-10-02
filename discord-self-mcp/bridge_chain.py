@@ -241,6 +241,12 @@ GEMINI_API_BASE = os.getenv(
     "GEMINI_API_BASE", "https://generativelanguage.googleapis.com/v1beta"
 ).rstrip("/")
 
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
+NVIDIA_API_BASE = os.getenv("NVIDIA_API_BASE", "https://integrate.api.nvidia.com/v1").rstrip("/")
+NVIDIA_MODEL = os.getenv(
+    "NVIDIA_MODEL", "nvidia/nemotron-3.5-lightning-30b-a3b"
+).strip()
+
 _DEFAULT_MODELS = [
     "gemini-3.1-flash-lite",
     "gemini-3.5-flash-lite",
@@ -393,8 +399,89 @@ async def _try_gemini_provider(
     return None
 
 
+
+class NvidiaRequestError(RuntimeError):
+    def __init__(self, status: int, message: str = "") -> None:
+        super().__init__(f"NVIDIA HTTP {status}{(': ' + message) if message else ''}")
+        self.status = status
+
+
+async def _nvidia_text(prompt: str, system: str, max_output_tokens: int = 220) -> str:
+    url = f"{NVIDIA_API_BASE}/chat/completions"
+    payload = {
+        "model": NVIDIA_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "max_tokens": max_output_tokens,
+        "stream": False,
+    }
+    async with httpx.AsyncClient(timeout=30) as http:
+        response = await http.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {NVIDIA_API_KEY}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            json=payload,
+        )
+    if response.is_error:
+        reason = ""
+        try:
+            body = response.json()
+            error = body.get("error") or {}
+            reason = str(error.get("message") or error.get("type") or "")[:120]
+        except Exception:
+            pass
+        raise NvidiaRequestError(response.status_code, reason)
+
+    data = response.json()
+    choices = data.get("choices") or []
+    if not choices:
+        raise NvidiaRequestError(502, "empty_choices")
+    message = (choices[0] or {}).get("message") or {}
+    text = str(message.get("content") or "").strip()
+    if not text:
+        raise NvidiaRequestError(502, "empty_text")
+    return " ".join(text.split())
+
+
+async def _try_nvidia_provider(
+    prompt: str,
+    system: str,
+    max_output_tokens: int,
+) -> str | None:
+    if not NVIDIA_API_KEY or not NVIDIA_MODEL:
+        return None
+    if not _model_available("nvidia", NVIDIA_MODEL):
+        return None
+    try:
+        text = await _nvidia_text(prompt, system, max_output_tokens)
+        auto.auto_reply_stats["provider"] = "nvidia"
+        auto.auto_reply_stats["providerModel"] = NVIDIA_MODEL
+        auto.auto_reply_stats["nvidiaReplies"] = int(auto.auto_reply_stats.get("nvidiaReplies", 0)) + 1
+        auto.auto_reply_stats["lastModelError"] = None
+        print(f"[ProviderChain] success provider=nvidia model={NVIDIA_MODEL}", flush=True)
+        return text
+    except NvidiaRequestError as exc:
+        _set_model_cooldown("nvidia", NVIDIA_MODEL, exc.status)
+        auto.auto_reply_stats["nvidiaFailures"] = int(auto.auto_reply_stats.get("nvidiaFailures", 0)) + 1
+        auto.auto_reply_stats["lastModelError"] = f"nvidia/{NVIDIA_MODEL}: HTTP {exc.status}"[:700]
+        print(f"[ProviderChain] fail provider=nvidia model={NVIDIA_MODEL} status={exc.status}; local next", flush=True)
+    except Exception as exc:
+        _set_model_cooldown("nvidia", NVIDIA_MODEL, 500)
+        auto.auto_reply_stats["nvidiaFailures"] = int(auto.auto_reply_stats.get("nvidiaFailures", 0)) + 1
+        auto.auto_reply_stats["lastModelError"] = f"nvidia/{NVIDIA_MODEL}: {type(exc).__name__}"[:700]
+        print(f"[ProviderChain] fail provider=nvidia model={NVIDIA_MODEL} error={type(exc).__name__}; local next", flush=True)
+    return None
+
+
 async def _auto_reply_chain(message: Any, trigger: str | None) -> str:
-    """Provider order: Groq -> Gemini key 1 models -> Gemini key 2 models -> local."""
+    """Provider order: Groq -> Gemini key 1 models -> Gemini key 2 models -> NVIDIA -> local."""
     context = await auto._recent_context(message)
 
     if base.GROQ_API_KEY:
@@ -426,6 +513,13 @@ async def _auto_reply_chain(message: Any, trigger: str | None) -> str:
         if reply not in auto._recent_bot_replies:
             return reply
 
+    print("[ProviderChain] Gemini 2 indisponível; tentando NVIDIA", flush=True)
+    nvidia_reply = await _try_nvidia_provider(prompt, system, 220)
+    if nvidia_reply is not None:
+        reply = nvidia_reply[: auto.AUTO_REPLY_MAX_CHARS]
+        if reply not in auto._recent_bot_replies:
+            return reply
+
     auto.auto_reply_stats["provider"] = "local"
     auto.auto_reply_stats["providerModel"] = None
     auto.auto_reply_stats["smartFallbacks"] = int(auto.auto_reply_stats.get("smartFallbacks", 0)) + 1
@@ -433,7 +527,7 @@ async def _auto_reply_chain(message: Any, trigger: str | None) -> str:
 
 
 async def _ask_chain(prompt: str) -> str:
-    """Provider order for !g ask: Groq -> Gemini 1 models -> Gemini 2 models -> local message."""
+    """Provider order for !g ask: Groq -> Gemini 1 models -> Gemini 2 models -> NVIDIA -> local message."""
     if base.GROQ_API_KEY:
         try:
             return await _original_ask_groq(prompt)
@@ -458,15 +552,21 @@ async def _ask_chain(prompt: str) -> str:
     if result is not None:
         return result[0][:700]
 
+    nvidia_reply = await _try_nvidia_provider(prompt[:1800], system, 220)
+    if nvidia_reply is not None:
+        return nvidia_reply[:700]
+
     return "As IAs externas estão indisponíveis agora. O fallback local continua ativo para a resposta automática."
 
 
 auto._generate_reply = _auto_reply_chain
 fun._ask_groq = _ask_chain
 
-auto.auto_reply_stats["providerOrder"] = ["groq", "gemini1", "gemini2", "local"]
+auto.auto_reply_stats["providerOrder"] = ["groq", "gemini1", "gemini2", "nvidia", "local"]
 auto.auto_reply_stats["gemini1Configured"] = bool(GEMINI_API_KEY_1)
 auto.auto_reply_stats["gemini2Configured"] = bool(GEMINI_API_KEY_2)
+auto.auto_reply_stats["nvidiaConfigured"] = bool(NVIDIA_API_KEY)
+auto.auto_reply_stats["nvidiaModel"] = NVIDIA_MODEL
 auto.auto_reply_stats["geminiModels1"] = GEMINI_MODELS_1
 auto.auto_reply_stats["geminiModels2"] = GEMINI_MODELS_2
 auto.auto_reply_stats["contextDbPath"] = CONTEXT_DB_PATH
