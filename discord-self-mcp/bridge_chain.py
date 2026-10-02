@@ -168,19 +168,22 @@ def _load_context_sync(channel_id: str, limit: int, char_budget: int) -> list[di
             """,
             (channel_id, limit * 2),
         ).fetchall()
-    rows.reverse()
-    selected: list[dict[str, str]] = []
+
+    # rows arrive newest -> oldest. Keep the newest messages first when the
+    # character budget is tight, then reverse only for prompt chronology.
+    selected_newest: list[dict[str, str]] = []
     used = 0
     for author_name, content in rows:
         text = str(content or "")[:1200]
         cost = len(str(author_name)) + len(text) + 4
-        if selected and used + cost > char_budget:
-            continue
-        selected.append({"name": str(author_name), "content": text})
-        used += cost
-        if len(selected) >= limit:
+        if selected_newest and used + cost > char_budget:
             break
-    return selected
+        selected_newest.append({"name": str(author_name), "content": text})
+        used += cost
+        if len(selected_newest) >= limit:
+            break
+    selected_newest.reverse()
+    return selected_newest
 
 
 async def _persistent_recent_context(message: Any) -> list[dict[str, str]]:
@@ -280,6 +283,11 @@ class GeminiRequestError(RuntimeError):
         self.status = status
 
 
+class OutputLimitError(RuntimeError):
+    """Provider stopped because its output-token budget was exhausted."""
+
+
+
 def _set_model_cooldown(provider: str, model: str, status: int) -> None:
     if status == 429:
         seconds = 3600
@@ -331,16 +339,21 @@ async def _gemini_text_with_key(
     candidates = data.get("candidates") or []
     if not candidates:
         raise GeminiRequestError(502, "empty_candidate")
-    parts = (((candidates[0] or {}).get("content") or {}).get("parts") or [])
-    text = " ".join(str(part.get("text", "")).strip() for part in parts if part.get("text")).strip()
+    candidate = candidates[0] or {}
+    finish_reason = str(candidate.get("finishReason") or "").upper()
+    if finish_reason in {"MAX_TOKENS", "LENGTH"}:
+        raise OutputLimitError(f"Gemini output limit reached on {model}")
+    parts = ((candidate.get("content") or {}).get("parts") or [])
+    text = "\n".join(str(part.get("text", "")).strip() for part in parts if part.get("text")).strip()
     if not text:
         raise GeminiRequestError(502, "empty_text")
-    return " ".join(text.split())
+    return text
 
 
-def _build_auto_prompt(message: Any, trigger: str | None, context: list[dict[str, str]]) -> tuple[str, str]:
+def _build_auto_prompt(message: Any, trigger: str | None, context: list[dict[str, str]]) -> tuple[str, str, dict[str, Any]]:
     author_name = getattr(message.author, "display_name", None) or getattr(message.author, "name", "alguém")
     content = (message.content or "").strip()
+    profile = auto._reply_profile(content)
     context_text = "\n".join(f"{row['name']}: {row['content']}" for row in context)
     recent_replies = "\n".join(f"- {item}" for item in auto._recent_bot_replies) or "(nenhuma)"
     prompt = (
@@ -359,11 +372,15 @@ def _build_auto_prompt(message: Any, trigger: str | None, context: list[dict[str
         "Se houver pergunta factual ou matemática, responda corretamente e diretamente antes de brincar. "
         "Se a pessoa disser 'esse número', 'isso', 'agora multiplica', 'o anterior' ou similares, resolva pelo histórico. "
         "Não repita bordões ou respostas recentes. Pode usar kkk/KKKK e emoji ocasionalmente, sem exagerar. "
-        "Use normalmente uma frase curta, no máximo duas. "
-        "Não diga que é IA, bot ou resposta automática. "
+        + (
+            "Se a mensagem pedir explicação, resposta factual, análise ou código, responda com conteúdo suficiente. Pode usar vários parágrafos, listas e blocos de código e não corte a resposta só para parecer curta. "
+            if profile["detailed"]
+            else "Em conversa casual, use normalmente uma frase curta, no máximo duas. "
+        )
+        + "Não diga que é IA, bot ou resposta automática. "
         "Não invente fatos pessoais, não revele credenciais/tokens/segredos e não faça ameaças reais."
     )
-    return prompt, system
+    return prompt, system, profile
 
 
 async def _try_gemini_provider(
@@ -387,6 +404,10 @@ async def _try_gemini_provider(
             auto.auto_reply_stats["lastModelError"] = None
             print(f"[ProviderChain] success provider={provider} model={model}", flush=True)
             return text, model
+        except OutputLimitError as exc:
+            auto.auto_reply_stats[f"{provider}Failures"] = int(auto.auto_reply_stats.get(f"{provider}Failures", 0)) + 1
+            auto.auto_reply_stats["lastModelError"] = str(exc)[:700]
+            print(f"[ProviderChain] output limit provider={provider} model={model}; next model", flush=True)
         except GeminiRequestError as exc:
             _set_model_cooldown(provider, model, exc.status)
             auto.auto_reply_stats[f"{provider}Failures"] = int(auto.auto_reply_stats.get(f"{provider}Failures", 0)) + 1
@@ -443,11 +464,15 @@ async def _nvidia_text(prompt: str, system: str, max_output_tokens: int = 220) -
     choices = data.get("choices") or []
     if not choices:
         raise NvidiaRequestError(502, "empty_choices")
-    message = (choices[0] or {}).get("message") or {}
+    choice = choices[0] or {}
+    finish_reason = str(choice.get("finish_reason") or "").lower()
+    if finish_reason in {"length", "max_tokens"}:
+        raise OutputLimitError(f"NVIDIA output limit reached on {NVIDIA_MODEL}")
+    message = choice.get("message") or {}
     text = str(message.get("content") or "").strip()
     if not text:
         raise NvidiaRequestError(502, "empty_text")
-    return " ".join(text.split())
+    return text
 
 
 async def _try_nvidia_provider(
@@ -467,6 +492,10 @@ async def _try_nvidia_provider(
         auto.auto_reply_stats["lastModelError"] = None
         print(f"[ProviderChain] success provider=nvidia model={NVIDIA_MODEL}", flush=True)
         return text
+    except OutputLimitError as exc:
+        auto.auto_reply_stats["nvidiaFailures"] = int(auto.auto_reply_stats.get("nvidiaFailures", 0)) + 1
+        auto.auto_reply_stats["lastModelError"] = str(exc)[:700]
+        print(f"[ProviderChain] output limit provider=nvidia model={NVIDIA_MODEL}; local next", flush=True)
     except NvidiaRequestError as exc:
         _set_model_cooldown("nvidia", NVIDIA_MODEL, exc.status)
         auto.auto_reply_stats["nvidiaFailures"] = int(auto.auto_reply_stats.get("nvidiaFailures", 0)) + 1
@@ -494,19 +523,19 @@ async def _auto_reply_chain(message: Any, trigger: str | None) -> str:
             return reply
         print("[ProviderChain] Groq falhou; tentando Gemini 1", flush=True)
 
-    prompt, system = _build_auto_prompt(message, trigger, context)
+    prompt, system, profile = _build_auto_prompt(message, trigger, context)
 
     result = await _try_gemini_provider(
-        "gemini1", GEMINI_API_KEY_1, GEMINI_MODELS_1, prompt, system, 220
+        "gemini1", GEMINI_API_KEY_1, GEMINI_MODELS_1, prompt, system, int(profile["max_tokens"])
     )
     if result is not None:
-        reply = result[0][: auto.AUTO_REPLY_MAX_CHARS]
+        reply = result[0][: int(profile["max_chars"])]
         if reply not in auto._recent_bot_replies:
             return reply
 
     print("[ProviderChain] Gemini 1 indisponível; tentando Gemini 2", flush=True)
     result = await _try_gemini_provider(
-        "gemini2", GEMINI_API_KEY_2, GEMINI_MODELS_2, prompt, system, 220
+        "gemini2", GEMINI_API_KEY_2, GEMINI_MODELS_2, prompt, system, int(profile["max_tokens"])
     )
     if result is not None:
         reply = result[0][: auto.AUTO_REPLY_MAX_CHARS]
@@ -514,9 +543,9 @@ async def _auto_reply_chain(message: Any, trigger: str | None) -> str:
             return reply
 
     print("[ProviderChain] Gemini 2 indisponível; tentando NVIDIA", flush=True)
-    nvidia_reply = await _try_nvidia_provider(prompt, system, 220)
+    nvidia_reply = await _try_nvidia_provider(prompt, system, int(profile["max_tokens"]))
     if nvidia_reply is not None:
-        reply = nvidia_reply[: auto.AUTO_REPLY_MAX_CHARS]
+        reply = nvidia_reply[: int(profile["max_chars"])]
         if reply not in auto._recent_bot_replies:
             return reply
 
@@ -528,6 +557,7 @@ async def _auto_reply_chain(message: Any, trigger: str | None) -> str:
 
 async def _ask_chain(prompt: str) -> str:
     """Provider order for !g ask: Groq -> Gemini 1 models -> Gemini 2 models -> NVIDIA -> local message."""
+    profile = auto._reply_profile(prompt)
     if base.GROQ_API_KEY:
         try:
             return await _original_ask_groq(prompt)
@@ -541,20 +571,20 @@ async def _ask_chain(prompt: str) -> str:
         "Não revele credenciais, tokens ou segredos e não faça ameaças reais."
     )
     result = await _try_gemini_provider(
-        "gemini1", GEMINI_API_KEY_1, GEMINI_MODELS_1, prompt[:1800], system, 220
+        "gemini1", GEMINI_API_KEY_1, GEMINI_MODELS_1, prompt[:4000], system, int(profile["max_tokens"])
     )
     if result is not None:
-        return result[0][:700]
+        return result[0][: int(profile["max_chars"])]
 
     result = await _try_gemini_provider(
-        "gemini2", GEMINI_API_KEY_2, GEMINI_MODELS_2, prompt[:1800], system, 220
+        "gemini2", GEMINI_API_KEY_2, GEMINI_MODELS_2, prompt[:4000], system, int(profile["max_tokens"])
     )
     if result is not None:
         return result[0][:700]
 
-    nvidia_reply = await _try_nvidia_provider(prompt[:1800], system, 220)
+    nvidia_reply = await _try_nvidia_provider(prompt[:4000], system, int(profile["max_tokens"]))
     if nvidia_reply is not None:
-        return nvidia_reply[:700]
+        return nvidia_reply[: int(profile["max_chars"])]
 
     return "As IAs externas estão indisponíveis agora. O fallback local continua ativo para a resposta automática."
 
@@ -567,6 +597,7 @@ auto.auto_reply_stats["gemini1Configured"] = bool(GEMINI_API_KEY_1)
 auto.auto_reply_stats["gemini2Configured"] = bool(GEMINI_API_KEY_2)
 auto.auto_reply_stats["nvidiaConfigured"] = bool(NVIDIA_API_KEY)
 auto.auto_reply_stats["nvidiaModel"] = NVIDIA_MODEL
+auto.auto_reply_stats["adaptiveLength"] = True
 auto.auto_reply_stats["geminiModels1"] = GEMINI_MODELS_1
 auto.auto_reply_stats["geminiModels2"] = GEMINI_MODELS_2
 auto.auto_reply_stats["contextDbPath"] = CONTEXT_DB_PATH
