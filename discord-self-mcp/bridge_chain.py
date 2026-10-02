@@ -562,7 +562,7 @@ def _build_auto_prompt(
         "Quando alguém disser que não gostou de uma brincadeira, que algo machucou, ou pedir mudança no modo de falar, trate isso como preferência duradoura daquela mesma pessoa e não repita o padrão ofensivo depois. "
         "Se houver pergunta factual ou matemática, responda corretamente e diretamente antes de brincar. "
         "Se a pessoa disser 'esse número', 'isso', 'agora multiplica', 'o anterior' ou similares, resolva pelo histórico. "
-        "Não repita bordões ou respostas recentes. Pode usar kkk/KKKK e emoji ocasionalmente, sem exagerar. "
+        "Não repita bordões ou respostas recentes. Pode usar kkk/KKKK, deboche, ironia e emoji ocasionalmente. Em conversa de zoeira, prefira uma punchline e continuidade da provocação em vez de encerrar com 'o que você precisa?' ou puxar um assunto aleatório. "
         + (
             "Quando o pedido envolver código: SEMPRE use bloco Markdown cercado por três crases e identifique a linguagem, preserve quebras de linha e indentação reais e nunca use crases simples para código multilinha. Se a mensagem atual só mudar a linguagem, como 'quero em python', reutilize o pedido de código imediatamente anterior do histórico e converta/adapte esse mesmo código, sem substituir por um exemplo genérico. Se a pessoa pedir para deixar o código maior, realmente expanda o programa com funções, validações, menus ou recursos coerentes em vez de apenas explicar. Você pode gerar uma resposta maior; o sistema dividirá automaticamente em várias mensagens do Discord. "
             if profile["kind"] == "code"
