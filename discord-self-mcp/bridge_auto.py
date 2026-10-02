@@ -32,6 +32,8 @@ AUTO_REPLY_DUPLICATE_WINDOW_SECONDS = max(0.0, float(os.getenv("AUTO_REPLY_DUPLI
 AUTO_REPLY_MAX_CONTEXT = max(1, min(100, int(os.getenv("AUTO_REPLY_MAX_CONTEXT", "60"))))
 AUTO_REPLY_CONTEXT_CHARS = max(1500, min(24000, int(os.getenv("AUTO_REPLY_CONTEXT_CHARS", "12000"))))
 AUTO_REPLY_MAX_CHARS = max(50, min(1500, int(os.getenv("AUTO_REPLY_MAX_CHARS", "450"))))
+AUTO_REPLY_LONG_MAX_CHARS = max(AUTO_REPLY_MAX_CHARS, min(1900, int(os.getenv("AUTO_REPLY_LONG_MAX_CHARS", "1850"))))
+AUTO_REPLY_ALLOW_SELF = os.getenv("AUTO_REPLY_ALLOW_SELF", "true").strip().lower() in {"1", "true", "yes", "on"}
 GROQ_AUTO_REPLY_MODEL = os.getenv("GROQ_AUTO_REPLY_MODEL", "openai/gpt-oss-120b").strip()
 
 _last_reply_at: dict[tuple[int, int], float] = defaultdict(float)
@@ -80,6 +82,32 @@ def _clean_message_text(message) -> str:
     for item in AUTO_REPLY_TRIGGERS:
         cleaned = re.sub(rf"(?<!\w){re.escape(item)}(?!\w)", "", cleaned, flags=re.IGNORECASE).strip()
     return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _reply_profile(text: str) -> dict[str, Any]:
+    """Choose response length from the user's actual intent."""
+    normalized = _normalize(text)
+    code_markers = (
+        "gere um codigo", "gera um codigo", "gerar um codigo", "crie um codigo",
+        "cria um codigo", "faca um codigo", "faz um codigo", "codigo em ",
+        "script", "programa em ", "escreva uma funcao", "crie uma funcao",
+        "gere uma funcao", "faz uma funcao",
+    )
+    detailed_markers = (
+        "explique", "explica", "me explica", "conte", "conta", "me conte",
+        "me fala", "fale sobre", "como funciona", "como fazer", "como faco",
+        "por que", "porque", "qual ", "quais ", "o que ", "quem ", "quando ",
+        "onde ", "passo a passo", "detalhe", "detalha", "analise", "analisa",
+        "compare", "compara", "resuma", "resume",
+    )
+    wants_code = any(marker in normalized for marker in code_markers)
+    wants_detail = "?" in text or wants_code or any(marker in normalized for marker in detailed_markers)
+
+    if wants_code:
+        return {"kind": "code", "detailed": True, "max_tokens": 1000, "max_chars": AUTO_REPLY_LONG_MAX_CHARS}
+    if wants_detail:
+        return {"kind": "detailed", "detailed": True, "max_tokens": 650, "max_chars": AUTO_REPLY_LONG_MAX_CHARS}
+    return {"kind": "casual", "detailed": False, "max_tokens": 220, "max_chars": AUTO_REPLY_MAX_CHARS}
 
 
 def _format_number(value: float) -> str:
@@ -265,6 +293,7 @@ async def _generate_reply(message, trigger: str | None) -> str:
     author_name = getattr(message.author, "display_name", None) or getattr(message.author, "name", "alguém")
     content = (message.content or "").strip()
     context = await _recent_context(message)
+    profile = _reply_profile(content)
 
     if not base.GROQ_API_KEY:
         auto_reply_stats["smartFallbacks"] += 1
@@ -285,7 +314,7 @@ async def _generate_reply(message, trigger: str | None) -> str:
     payload = {
         "model": GROQ_AUTO_REPLY_MODEL,
         "temperature": 0.85,
-        "max_completion_tokens": 180,
+        "max_completion_tokens": profile["max_tokens"],
         "messages": [
             {
                 "role": "system",
@@ -299,8 +328,12 @@ async def _generate_reply(message, trigger: str | None) -> str:
                     "Se for só uma menção sem assunto, pode perguntar o que a pessoa quer, mas varie a frase. "
                     "Nunca copie uma das respostas recentes listadas no prompt e evite bordões repetidos. "
                     "Pode usar risadas como kkk/KKKK e emoji ocasionalmente, sem exagerar. "
-                    "Use normalmente 1 frase curta, no máximo 2. "
-                    "Não diga que é IA, bot ou resposta automática. "
+                    + (
+                        "Se a mensagem pedir explicação, resposta factual, análise ou código, responda com conteúdo suficiente, podendo usar vários parágrafos, listas e blocos de código quando fizer sentido. Não corte a resposta só para parecer curta. "
+                        if profile["detailed"]
+                        else "Em conversa casual, use normalmente 1 frase curta, no máximo 2. "
+                    )
+                    + "Não diga que é IA, bot ou resposta automática. "
                     "Não invente fatos pessoais, não revele segredos/credenciais e não faça ameaças reais."
                 ),
             },
@@ -319,10 +352,14 @@ async def _generate_reply(message, trigger: str | None) -> str:
             detail = response.text.replace("\n", " ")[:500]
             raise RuntimeError(f"Groq HTTP {response.status_code}: {detail}")
         data = response.json()
-        reply = str(data["choices"][0]["message"]["content"]).strip()
+        choice = data["choices"][0]
+        finish_reason = str(choice.get("finish_reason") or "").lower()
+        if finish_reason in {"length", "max_tokens"}:
+            raise RuntimeError("Groq output token limit reached")
+        reply = str(choice["message"]["content"]).strip()
         if not reply:
             raise RuntimeError("Groq returned an empty reply")
-        reply = reply[:AUTO_REPLY_MAX_CHARS]
+        reply = reply[: int(profile["max_chars"])]
         if reply in _recent_bot_replies:
             auto_reply_stats["smartFallbacks"] += 1
             return _smart_fallback_reply(message, trigger, context)
@@ -341,9 +378,19 @@ async def on_message(message) -> None:
         return
 
     author = getattr(message, "author", None)
-    if author is None or getattr(author, "id", None) == getattr(client.user, "id", None):
+    if author is None:
         return
-    if bool(getattr(author, "bot", False)):
+
+    is_self = getattr(author, "id", None) == getattr(client.user, "id", None)
+    if is_self:
+        if not AUTO_REPLY_ALLOW_SELF:
+            return
+        # Messages generated by this auto-reply are also "self" messages.
+        # Ignore them so manual self-triggers work without reply loops.
+        current_text = (message.content or "").strip()
+        if current_text and current_text in _recent_bot_replies:
+            return
+    elif bool(getattr(author, "bot", False)):
         return
 
     guild = getattr(message, "guild", None) or getattr(getattr(message, "channel", None), "guild", None)
@@ -391,8 +438,8 @@ async def on_message(message) -> None:
 
     try:
         reply = await _generate_reply(message, trigger)
-        sent = await message.channel.send(reply, reference=message, mention_author=False)
         _recent_bot_replies.append(reply)
+        sent = await message.channel.send(reply, reference=message, mention_author=False)
         auto_reply_stats["replied"] += 1
         auto_reply_stats["lastReplyAt"] = time.time()
         print(
@@ -411,10 +458,13 @@ async def auto_reply_status() -> dict[str, Any]:
         "channelId": AUTO_REPLY_CHANNEL_ID,
         "triggers": AUTO_REPLY_TRIGGERS,
         "mentionTrigger": True,
+        "allowSelfTrigger": AUTO_REPLY_ALLOW_SELF,
         "cooldownSeconds": AUTO_REPLY_COOLDOWN_SECONDS,
         "duplicateWindowSeconds": AUTO_REPLY_DUPLICATE_WINDOW_SECONDS,
         "maxContextMessages": AUTO_REPLY_MAX_CONTEXT,
         "contextCharBudget": AUTO_REPLY_CONTEXT_CHARS,
+        "casualMaxChars": AUTO_REPLY_MAX_CHARS,
+        "longMaxChars": AUTO_REPLY_LONG_MAX_CHARS,
         "model": GROQ_AUTO_REPLY_MODEL if base.GROQ_API_KEY else None,
         "groqConfigured": bool(base.GROQ_API_KEY),
         "recentReplies": list(_recent_bot_replies),
