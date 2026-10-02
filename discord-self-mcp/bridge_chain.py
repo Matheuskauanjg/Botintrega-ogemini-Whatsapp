@@ -80,6 +80,25 @@ def _open_context_db() -> sqlite3.Connection:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_messages_channel_time ON messages(channel_id, created_at DESC)"
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS social_states (
+            guild_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            user_name TEXT NOT NULL,
+            friendship INTEGER NOT NULL DEFAULT 50,
+            trust INTEGER NOT NULL DEFAULT 50,
+            respect INTEGER NOT NULL DEFAULT 50,
+            stress INTEGER NOT NULL DEFAULT 10,
+            sadness INTEGER NOT NULL DEFAULT 5,
+            irritation INTEGER NOT NULL DEFAULT 5,
+            energy INTEGER NOT NULL DEFAULT 70,
+            interactions INTEGER NOT NULL DEFAULT 0,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (guild_id, user_id)
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -203,6 +222,203 @@ def _message_to_row(message: Any) -> dict[str, Any] | None:
         "is_self": bool(client.user is not None and getattr(author, "id", None) == getattr(client.user, "id", None)),
         "created_at": timestamp,
     }
+
+
+def _clamp_meter(value: int | float) -> int:
+    return max(0, min(100, int(round(value))))
+
+
+def _mood_from_state(state: dict[str, Any]) -> str:
+    if state["sadness"] >= 70:
+        return "abatido"
+    if state["stress"] >= 75 and state["irritation"] >= 60:
+        return "no limite"
+    if state["irritation"] >= 70:
+        return "irritado"
+    if state["friendship"] >= 78 and state["trust"] >= 68:
+        return "muito próximo"
+    if state["friendship"] >= 65:
+        return "amigável"
+    if state["energy"] <= 30:
+        return "cansado"
+    if state["energy"] >= 80:
+        return "animado"
+    return "neutro"
+
+
+def _get_social_state_sync(guild_id: str, user_id: str, user_name: str = "") -> dict[str, Any]:
+    if not guild_id or not user_id:
+        return {}
+    with _open_context_db() as conn:
+        row = conn.execute(
+            """
+            SELECT friendship, trust, respect, stress, sadness, irritation, energy, interactions, user_name
+            FROM social_states
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (guild_id, user_id),
+        ).fetchone()
+
+    if row is None:
+        state = {
+            "friendship": 50,
+            "trust": 50,
+            "respect": 50,
+            "stress": 10,
+            "sadness": 5,
+            "irritation": 5,
+            "energy": 70,
+            "interactions": 0,
+            "userName": user_name,
+        }
+    else:
+        state = {
+            "friendship": int(row[0]),
+            "trust": int(row[1]),
+            "respect": int(row[2]),
+            "stress": int(row[3]),
+            "sadness": int(row[4]),
+            "irritation": int(row[5]),
+            "energy": int(row[6]),
+            "interactions": int(row[7]),
+            "userName": str(row[8] or user_name),
+        }
+    state["mood"] = _mood_from_state(state)
+    return state
+
+
+def _update_social_state_sync(row: dict[str, Any]) -> dict[str, Any]:
+    guild_id = str(row.get("guild_id") or "")
+    user_id = str(row.get("author_id") or "")
+    user_name = str(row.get("author_name") or "alguém")
+    if not guild_id or not user_id or row.get("is_self"):
+        return {}
+
+    state = _get_social_state_sync(guild_id, user_id, user_name)
+    if not state:
+        return {}
+
+    text = _normalize_memory_text(str(row.get("content") or ""))
+    laughter = any(marker in text for marker in ("kkk", "kkkk", "haha", "rsrs", "😂", "🤣", "💀"))
+    compliment = any(marker in text for marker in (
+        "te amo", "amo voce", "amo vc", "gosto de voce", "gosto de vc",
+        "voce e foda", "vc e foda", "voce e brabo", "vc e brabo", "lindo",
+        "perfeito", "bom demais", "mandou bem",
+    ))
+    gratitude = any(marker in text for marker in ("obrigado", "obrigada", "valeu", "vlw", "brigado", "thanks"))
+    apology = any(marker in text for marker in ("desculpa", "foi mal", "perdao", "perdão", "mal ai", "mal aí"))
+    hurt = any(marker in text for marker in (
+        "nao gostei", "não gostei", "machucou", "me magoou", "chateado", "chateada",
+        "triste", "decepcionado", "decepcionada", "nao quero mais falar", "não quero mais falar",
+    ))
+    hostile = any(marker in text for marker in (
+        "te odeio", "odeio voce", "odeio vc", "cala a boca", "some daqui",
+        "vai se foder", "vai tomar no cu", "fdp", "filho da puta", "arrombado",
+        "idiota", "burro", "burra", "desgracado", "desgraçado",
+    ))
+    playful_provocation = laughter or any(marker in text for marker in (
+        "otario", "otário", "vagabundo", "corno", "viado", "porra", "caralho",
+        "vsf", "se fode", "kkkk",
+    ))
+
+    # Natural recovery between interactions keeps temporary emotions from becoming permanent.
+    state["stress"] = _clamp_meter(state["stress"] - 1)
+    state["sadness"] = _clamp_meter(state["sadness"] - 1)
+    state["irritation"] = _clamp_meter(state["irritation"] - 1)
+    if state["energy"] < 65:
+        state["energy"] = _clamp_meter(state["energy"] + 1)
+    elif state["energy"] > 80:
+        state["energy"] = _clamp_meter(state["energy"] - 1)
+
+    if compliment:
+        state["friendship"] += 5
+        state["trust"] += 3
+        state["respect"] += 2
+        state["stress"] -= 3
+        state["sadness"] -= 3
+        state["energy"] += 3
+    if gratitude:
+        state["friendship"] += 2
+        state["trust"] += 2
+        state["respect"] += 1
+        state["stress"] -= 1
+    if apology:
+        state["trust"] += 3
+        state["respect"] += 1
+        state["stress"] -= 3
+        state["sadness"] -= 2
+        state["irritation"] -= 5
+    if hurt:
+        state["friendship"] -= 1
+        state["trust"] -= 1
+        state["stress"] += 4
+        state["sadness"] += 6
+        state["irritation"] -= 2
+    if hostile:
+        if playful_provocation:
+            state["friendship"] += 1
+            state["stress"] += 1
+            state["irritation"] += 2
+            state["energy"] += 3
+        else:
+            state["friendship"] -= 4
+            state["trust"] -= 2
+            state["respect"] -= 3
+            state["stress"] += 5
+            state["sadness"] += 2
+            state["irritation"] += 7
+    elif playful_provocation:
+        state["friendship"] += 1
+        state["irritation"] += 1
+        state["energy"] += 2
+
+    for key in ("friendship", "trust", "respect", "stress", "sadness", "irritation", "energy"):
+        state[key] = _clamp_meter(state[key])
+    state["interactions"] = int(state.get("interactions", 0)) + 1
+    state["userName"] = user_name
+    state["mood"] = _mood_from_state(state)
+
+    with _open_context_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO social_states (
+                guild_id, user_id, user_name, friendship, trust, respect,
+                stress, sadness, irritation, energy, interactions, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                user_name=excluded.user_name,
+                friendship=excluded.friendship,
+                trust=excluded.trust,
+                respect=excluded.respect,
+                stress=excluded.stress,
+                sadness=excluded.sadness,
+                irritation=excluded.irritation,
+                energy=excluded.energy,
+                interactions=excluded.interactions,
+                updated_at=excluded.updated_at
+            """,
+            (
+                guild_id, user_id, user_name,
+                state["friendship"], state["trust"], state["respect"],
+                state["stress"], state["sadness"], state["irritation"],
+                state["energy"], state["interactions"], time.time(),
+            ),
+        )
+        conn.commit()
+    return state
+
+
+async def _social_state_for_message(message: Any) -> dict[str, Any]:
+    author = getattr(message, "author", None)
+    guild = getattr(message, "guild", None) or getattr(getattr(message, "channel", None), "guild", None)
+    if author is None or guild is None:
+        return {}
+    return await asyncio.to_thread(
+        _get_social_state_sync,
+        str(getattr(guild, "id", "")),
+        str(getattr(author, "id", "")),
+        str(getattr(author, "display_name", None) or getattr(author, "name", "alguém")),
+    )
 
 
 async def _store_message(message: Any) -> None:
@@ -404,6 +620,7 @@ async def _persistent_recent_context(message: Any) -> list[dict[str, str]]:
 
 auto._recent_context = _persistent_recent_context
 auto._long_term_context_provider = _persistent_long_term_context
+auto._social_state_provider = _social_state_for_message
 
 # Persist every message seen in the selected context channels, then continue the
 # existing !g / auto-reply message handlers.
@@ -412,10 +629,28 @@ _previous_on_message_chain = client.on_message
 
 @client.event
 async def on_message(message: Any) -> None:
-    try:
-        await _store_message(message)
-    except Exception as exc:
-        print(f"[Context] store failed: {type(exc).__name__}: {exc}", flush=True)
+    row = _message_to_row(message)
+    if row is not None:
+        try:
+            await asyncio.to_thread(_store_row_sync, row)
+        except Exception as exc:
+            print(f"[Context] store failed: {type(exc).__name__}: {exc}", flush=True)
+
+        author = getattr(message, "author", None)
+        is_bot = bool(getattr(author, "bot", False))
+        if not row.get("is_self") and not is_bot:
+            try:
+                state = await asyncio.to_thread(_update_social_state_sync, row)
+                if state:
+                    print(
+                        f"[SocialState] user={row.get('author_id')} friendship={state['friendship']} "
+                        f"stress={state['stress']} sadness={state['sadness']} "
+                        f"irritation={state['irritation']} mood={state['mood']}",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(f"[SocialState] update failed: {type(exc).__name__}: {exc}", flush=True)
+
     await _previous_on_message_chain(message)
 
 
@@ -539,18 +774,32 @@ def _build_auto_prompt(
     trigger: str | None,
     context: list[dict[str, str]],
     long_term: list[dict[str, str]],
+    social_state: dict[str, Any],
 ) -> tuple[str, str, dict[str, Any]]:
     author_name = getattr(message.author, "display_name", None) or getattr(message.author, "name", "alguém")
     content = (message.content or "").strip()
     profile = auto._reply_profile(content)
-    context_text = "\n".join(f"{row['name']}: {row['content']}" for row in context)
+    context_text = "\n".join(
+        f"[id={row.get('id', '?')}] {row['name']}: {row['content']}" for row in context
+    )
+    long_term_text = "\n".join(
+        f"[id={row.get('id', '?')}] {row['name']}: {row['content']}" for row in long_term
+    )
+    social_text = (
+        " | ".join(f"{key}={value}" for key, value in social_state.items())
+        if social_state else "(sem estado social salvo)"
+    )
     recent_replies = "\n".join(f"- {item}" for item in auto._recent_bot_replies) or "(nenhuma)"
     prompt = (
         f"Servidor Discord: {getattr(getattr(message.channel, 'guild', None), 'name', '')}\n"
         f"Canal: {getattr(message.channel, 'name', str(message.channel.id))}\n"
         f"Gatilho detectado: {trigger or 'menção'}\n"
-        f"Histórico persistido da conversa, do mais antigo para o mais novo:\n"
-        f"{context_text or '(sem contexto)'}\n\n"
+        f"Contexto recente detalhado, do mais antigo para o mais novo:\n"
+        f"{context_text or '(sem contexto recente)'}\n\n"
+        f"Memórias relevantes do histórico inteiro:\n"
+        f"{long_term_text or '(nenhuma memória antiga relevante)'}\n\n"
+        f"Estado emocional/social do Greed com {author_name} (0-100; não é diagnóstico da pessoa):\n"
+        f"{social_text}\n\n"
         f"Respostas recentes que você já deu e deve evitar repetir:\n{recent_replies}\n\n"
         f"Mensagem atual de {author_name}: {content or '(somente menção)'}"
     )
@@ -559,17 +808,23 @@ def _build_auto_prompt(
         "Responda em português do Brasil de forma curta, espontânea e informal, como alguém do grupo. "
         "Use o contexto recente e as memórias relevantes do histórico inteiro para manter continuidade, entender referências, pessoas, apelidos, preferências, correções e limites já expressos. "
         "A mensagem atual tem prioridade; não fique preso em um assunto antigo só porque ele aparece na memória. "
-        "Quando alguém disser que não gostou de uma brincadeira, que algo machucou, ou pedir mudança no modo de falar, trate isso como preferência duradoura daquela mesma pessoa e não repita o padrão ofensivo depois. "
+        "O estilo do Greed pode ser zoeiro, sarcástico e provocador. Quando a outra pessoa estiver entrando na brincadeira, pode devolver na mesma energia ou um pouco mais forte. "
+        "Use o estado emocional/social como tendência: amizade/confiança altas = mais intimidade; estresse/irritação altos = mais seco e provocador; tristeza alta = mais abatido/sensível; energia baixa = mais cansado. Não mostre os números espontaneamente. "
+        "Se houver pedido claro para parar uma zoação ou respeitar um limite específico, respeite. "
         "Se houver pergunta factual ou matemática, responda corretamente e diretamente antes de brincar. "
         "Se a pessoa disser 'esse número', 'isso', 'agora multiplica', 'o anterior' ou similares, resolva pelo histórico. "
         "Não repita bordões ou respostas recentes. Pode usar kkk/KKKK, deboche, ironia e emoji ocasionalmente. Em conversa de zoeira, prefira uma punchline e continuidade da provocação em vez de encerrar com 'o que você precisa?' ou puxar um assunto aleatório. "
         + (
-            "Quando o pedido envolver código: SEMPRE use bloco Markdown cercado por três crases e identifique a linguagem, preserve quebras de linha e indentação reais e nunca use crases simples para código multilinha. Se a mensagem atual só mudar a linguagem, como 'quero em python', reutilize o pedido de código imediatamente anterior do histórico e converta/adapte esse mesmo código, sem substituir por um exemplo genérico. Se a pessoa pedir para deixar o código maior, realmente expanda o programa com funções, validações, menus ou recursos coerentes em vez de apenas explicar. Você pode gerar uma resposta maior; o sistema dividirá automaticamente em várias mensagens do Discord. "
-            if profile["kind"] == "code"
+            "Em RPG, seja muito mais detalhista e consistente. Separe quando fizer sentido em: 🎭 Narrador, 🧙 Jogador/Personagens, 👹 Inimigos/NPCs e 📊 Estado do combate. Acompanhe HP/vida atual e máxima, mana/MP, stamina quando existir, dano bruto, defesa/armadura, dano final, cura, efeitos, buffs/debuffs, cooldowns, iniciativa/turno, inventário e XP quando relevantes. Mostre cálculos de dano e nunca mude números silenciosamente. O Narrador controla cenário, NPCs e inimigos, mas não decide ações importantes pelo jogador sem pedido. Preserve valores anteriores; se faltar um valor, declare o valor inicial assumido. Em cenas sem combate, dê descrição rica, consequências, falas e opções de ação. "
+            if profile["kind"] == "rpg"
             else (
-                "Se a mensagem pedir explicação, resposta factual ou análise, responda com conteúdo suficiente. Pode usar vários parágrafos e listas e não corte a resposta só para parecer curta. "
-                if profile["detailed"]
-                else "Em conversa casual, use normalmente uma frase curta, no máximo duas. "
+                "Quando o pedido envolver código: SEMPRE use bloco Markdown cercado por três crases e identifique a linguagem, preserve quebras de linha e indentação reais e nunca use crases simples para código multilinha. Se a mensagem atual só mudar a linguagem, como 'quero em python', reutilize o pedido de código imediatamente anterior do histórico e converta/adapte esse mesmo código, sem substituir por um exemplo genérico. Se a pessoa pedir para deixar o código maior, realmente expanda o programa com funções, validações, menus ou recursos coerentes em vez de apenas explicar. Você pode gerar uma resposta maior; o sistema dividirá automaticamente em várias mensagens do Discord. "
+                if profile["kind"] == "code"
+                else (
+                    "Se a mensagem pedir explicação, resposta factual ou análise, responda com conteúdo suficiente. Pode usar vários parágrafos e listas e não corte a resposta só para parecer curta. "
+                    if profile["detailed"]
+                    else "Em conversa casual, use normalmente uma frase curta, no máximo duas. "
+                )
             )
         )
         + "Nunca diga que é IA, bot, resposta automática, 'só código', 'código e bytes' ou equivalente. "
@@ -713,6 +968,7 @@ async def _auto_reply_chain(message: Any, trigger: str | None) -> str:
     """Provider order: Groq -> Gemini key 1 models -> Gemini key 2 models -> NVIDIA -> local."""
     context = await auto._recent_context(message)
     long_term = await _persistent_long_term_context(message)
+    social_state = await _social_state_for_message(message)
 
     if base.GROQ_API_KEY:
         failures_before = int(auto.auto_reply_stats.get("groqFailures", 0))
@@ -724,7 +980,7 @@ async def _auto_reply_chain(message: Any, trigger: str | None) -> str:
             return reply
         print("[ProviderChain] Groq falhou; tentando Gemini 1", flush=True)
 
-    prompt, system, profile = _build_auto_prompt(message, trigger, context, long_term)
+    prompt, system, profile = _build_auto_prompt(message, trigger, context, long_term, social_state)
 
     result = await _try_gemini_provider(
         "gemini1", GEMINI_API_KEY_1, GEMINI_MODELS_1, prompt, system, int(profile["max_tokens"])
@@ -810,6 +1066,9 @@ auto.auto_reply_stats["longTermItems"] = CONTEXT_LONGTERM_ITEMS
 auto.auto_reply_stats["longTermChars"] = CONTEXT_LONGTERM_CHARS
 auto.auto_reply_stats["wholeChatRetrieval"] = True
 auto.auto_reply_stats["backfillMessages"] = CONTEXT_BACKFILL_MESSAGES
+auto.auto_reply_stats["socialStateEnabled"] = True
+auto.auto_reply_stats["socialMeters"] = ["friendship", "trust", "respect", "stress", "sadness", "irritation", "energy"]
+auto.auto_reply_stats["rpgDetailedMode"] = True
 
 
 @app.get("/api/context/status", dependencies=[Depends(base.require_api_token)])
@@ -831,3 +1090,19 @@ async def context_status() -> dict[str, Any]:
         }
 
     return await asyncio.to_thread(stats)
+
+
+@app.get("/api/social-state/{user_id}", dependencies=[Depends(base.require_api_token)])
+async def social_state_status(user_id: str) -> dict[str, Any]:
+    guild_id = auto.AUTO_REPLY_GUILD_ID
+
+    def read_state() -> dict[str, Any]:
+        return _get_social_state_sync(guild_id, user_id)
+
+    state = await asyncio.to_thread(read_state)
+    return {
+        "guildId": guild_id,
+        "userId": user_id,
+        "state": state,
+        "note": "Os medidores representam o estado/personagem do Greed em relação ao membro, não um diagnóstico psicológico do membro.",
+    }
