@@ -311,6 +311,13 @@ async def _generate_reply(message, trigger: str | None) -> str:
     author_name = getattr(message.author, "display_name", None) or getattr(message.author, "name", "alguém")
     content = (message.content or "").strip()
     context = await _recent_context(message)
+    long_term: list[dict[str, str]] = []
+    long_term_provider = globals().get("_long_term_context_provider")
+    if callable(long_term_provider):
+        try:
+            long_term = await long_term_provider(message)
+        except Exception as exc:
+            print(f"[Context] long-term retrieval failed: {type(exc).__name__}: {exc}", flush=True)
     profile = _reply_profile(content)
     print(
         f"[AutoReply] profile={profile['kind']} max_tokens={profile['max_tokens']} max_chars={profile['max_chars']}",
@@ -321,14 +328,21 @@ async def _generate_reply(message, trigger: str | None) -> str:
         auto_reply_stats["smartFallbacks"] += 1
         return _smart_fallback_reply(message, trigger, context)
 
-    context_text = "\n".join(f"{row['name']}: {row['content']}" for row in context)
+    context_text = "\n".join(
+        f"[id={row.get('id', '?')}] {row['name']}: {row['content']}" for row in context
+    )
+    long_term_text = "\n".join(
+        f"[id={row.get('id', '?')}] {row['name']}: {row['content']}" for row in long_term
+    )
     recent_replies = "\n".join(f"- {item}" for item in _recent_bot_replies) or "(nenhuma)"
     user_prompt = (
         f"Servidor Discord: {getattr(getattr(message.channel, 'guild', None), 'name', '')}\n"
         f"Canal: {getattr(message.channel, 'name', str(message.channel.id))}\n"
         f"Gatilho detectado: {trigger or 'menção'}\n"
-        f"Conversa recente do canal, incluindo mensagens que não marcaram você, do mais antigo para o mais novo:\n"
-        f"{context_text or '(sem contexto)'}\n\n"
+        f"Conversa recente detalhada do canal, do mais antigo para o mais novo:\n"
+        f"{context_text or '(sem contexto recente)'}\n\n"
+        f"Memórias relevantes recuperadas do HISTÓRICO INTEIRO do canal:\n"
+        f"{long_term_text or '(nenhuma memória antiga relevante)'}\n\n"
         f"Respostas recentes que VOCÊ já deu e deve evitar repetir:\n{recent_replies}\n\n"
         f"Mensagem atual de {author_name}: {content or '(somente menção)'}"
     )
@@ -343,15 +357,17 @@ async def _generate_reply(message, trigger: str | None) -> str:
                 "content": (
                     "Você está conversando no Discord pela conta Greed. "
                     "Fale em português do Brasil de forma curta, espontânea e informal, como alguém do grupo. "
-                    "A mensagem atual é o foco principal, mas entenda toda a conversa recente fornecida antes de responder. "
-                    "Mensagens sem menção também fazem parte do contexto e podem explicar piadas, assunto e continuidade. "
+                    "A mensagem atual é o foco principal, mas entenda a conversa recente e as memórias relevantes recuperadas do histórico inteiro antes de responder. "
+                    "Mensagens sem menção também fazem parte do contexto e podem explicar piadas, assunto, pessoas e continuidade. "
+                    "Não fique preso em assunto antigo quando a conversa já mudou. Memória antiga é contexto, não obrigação de continuar o tema. "
+                    "Se uma pessoa disser que não gostou de uma brincadeira, que algo machucou, ou pedir mudança no modo de falar, trate isso como preferência duradoura daquela mesma pessoa e não repita o padrão depois. "
                     "Se houver uma pergunta factual ou matemática, responda corretamente e diretamente antes de brincar. "
                     "Se a pessoa usar expressões como 'esse número', 'isso', 'agora multiplica' ou similares, resolva a referência usando a conversa recente. "
                     "Se for só uma menção sem assunto, pode perguntar o que a pessoa quer, mas varie a frase. "
                     "Nunca copie uma das respostas recentes listadas no prompt e evite bordões repetidos. "
                     "Pode usar risadas como kkk/KKKK e emoji ocasionalmente, sem exagerar. "
                     + (
-                        "Quando o pedido envolver código: SEMPRE escreva o código em bloco Markdown cercado por três crases, informando a linguagem, preserve quebras de linha e indentação reais e nunca coloque código multilinha entre crases simples. Se a mensagem atual só mudar a linguagem, como 'quero em python', reutilize o pedido de código imediatamente anterior do histórico e apenas converta/adapte esse mesmo código; não troque por um exemplo genérico. Mantenha a resposta completa dentro de aproximadamente 1800 caracteres para caber no Discord. "
+                        "Quando o pedido envolver código: SEMPRE escreva o código em bloco Markdown cercado por três crases, informando a linguagem, preserve quebras de linha e indentação reais e nunca coloque código multilinha entre crases simples. Se a mensagem atual só mudar a linguagem, como 'quero em python', reutilize o pedido de código imediatamente anterior do histórico e apenas converta/adapte esse mesmo código; não troque por um exemplo genérico. Se pedirem para deixar maior, realmente expanda o programa. Você pode gerar resposta longa; o sistema divide automaticamente em várias mensagens do Discord. "
                         if profile["kind"] == "code"
                         else (
                             "Se a mensagem pedir explicação, resposta factual ou análise, responda com conteúdo suficiente, podendo usar vários parágrafos e listas. Não corte a resposta só para parecer curta. "
@@ -359,7 +375,7 @@ async def _generate_reply(message, trigger: str | None) -> str:
                             else "Em conversa casual, use normalmente 1 frase curta, no máximo 2. "
                         )
                     )
-                    + "Não diga que é IA, bot ou resposta automática. "
+                    + "Nunca diga que é IA, bot, resposta automática, 'só código', 'código e bytes' ou equivalente. "
                     "Não invente fatos pessoais, não revele segredos/credenciais e não faça ameaças reais."
                 ),
             },
@@ -385,8 +401,10 @@ async def _generate_reply(message, trigger: str | None) -> str:
         reply = str(choice["message"]["content"]).strip()
         if not reply:
             raise RuntimeError("Groq returned an empty reply")
-        if profile["kind"] == "code" and "\x60\x60\x60" not in reply:
-            raise RuntimeError("Groq returned malformed code formatting")
+        if profile["kind"] == "code":
+            fence_count = reply.count("\x60\x60\x60")
+            if fence_count < 2 or fence_count % 2 != 0:
+                raise RuntimeError("Groq returned incomplete code fence")
         reply = reply[: int(profile["max_chars"])]
         if reply in _recent_bot_replies:
             auto_reply_stats["smartFallbacks"] += 1
