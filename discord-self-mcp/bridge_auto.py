@@ -92,6 +92,9 @@ def _reply_profile(text: str) -> dict[str, Any]:
         "cria um codigo", "faca um codigo", "faz um codigo", "codigo em ",
         "script", "programa em ", "escreva uma funcao", "crie uma funcao",
         "gere uma funcao", "faz uma funcao",
+        "em python", "em c++", "em cpp", "em c#", "em csharp",
+        "em javascript", "em js", "em typescript", "em ts", "em java",
+        "em lua", "em rust", "em golang", "em go", "em php", "em ruby",
     )
     detailed_markers = (
         "explique", "explica", "me explica", "conte", "conta", "me conte",
@@ -329,9 +332,13 @@ async def _generate_reply(message, trigger: str | None) -> str:
                     "Nunca copie uma das respostas recentes listadas no prompt e evite bordões repetidos. "
                     "Pode usar risadas como kkk/KKKK e emoji ocasionalmente, sem exagerar. "
                     + (
-                        "Se a mensagem pedir explicação, resposta factual, análise ou código, responda com conteúdo suficiente, podendo usar vários parágrafos, listas e blocos de código quando fizer sentido. Não corte a resposta só para parecer curta. "
-                        if profile["detailed"]
-                        else "Em conversa casual, use normalmente 1 frase curta, no máximo 2. "
+                        "Quando o pedido envolver código: SEMPRE escreva o código em bloco Markdown cercado por três crases, informando a linguagem, preserve quebras de linha e indentação reais e nunca coloque código multilinha entre crases simples. Se a mensagem atual só mudar a linguagem, como 'quero em python', reutilize o pedido de código imediatamente anterior do histórico e apenas converta/adapte esse mesmo código; não troque por um exemplo genérico. Mantenha a resposta completa dentro de aproximadamente 1800 caracteres para caber no Discord. "
+                        if profile["kind"] == "code"
+                        else (
+                            "Se a mensagem pedir explicação, resposta factual ou análise, responda com conteúdo suficiente, podendo usar vários parágrafos e listas. Não corte a resposta só para parecer curta. "
+                            if profile["detailed"]
+                            else "Em conversa casual, use normalmente 1 frase curta, no máximo 2. "
+                        )
                     )
                     + "Não diga que é IA, bot ou resposta automática. "
                     "Não invente fatos pessoais, não revele segredos/credenciais e não faça ameaças reais."
@@ -359,6 +366,8 @@ async def _generate_reply(message, trigger: str | None) -> str:
         reply = str(choice["message"]["content"]).strip()
         if not reply:
             raise RuntimeError("Groq returned an empty reply")
+        if profile["kind"] == "code" and "\x60\x60\x60" not in reply:
+            raise RuntimeError("Groq returned malformed code formatting")
         reply = reply[: int(profile["max_chars"])]
         if reply in _recent_bot_replies:
             auto_reply_stats["smartFallbacks"] += 1
