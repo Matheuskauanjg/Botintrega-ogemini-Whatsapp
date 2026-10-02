@@ -1,7 +1,9 @@
 import asyncio
 import os
+import re
 import sqlite3
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,8 @@ CONTEXT_RETENTION_DAYS = max(1, int(os.getenv("CONTEXT_RETENTION_DAYS", "90")))
 CONTEXT_MAX_ROWS_PER_CHANNEL = max(500, int(os.getenv("CONTEXT_MAX_ROWS_PER_CHANNEL", "20000")))
 CONTEXT_PROMPT_MESSAGES = max(10, min(200, int(os.getenv("CONTEXT_PROMPT_MESSAGES", "80"))))
 CONTEXT_PROMPT_CHARS = max(2000, min(50000, int(os.getenv("CONTEXT_PROMPT_CHARS", "18000"))))
+CONTEXT_LONGTERM_ITEMS = max(8, min(60, int(os.getenv("CONTEXT_LONGTERM_ITEMS", "24"))))
+CONTEXT_LONGTERM_CHARS = max(2000, min(24000, int(os.getenv("CONTEXT_LONGTERM_CHARS", "9000"))))
 
 _default_context_channels = [
     os.getenv("AUTO_REPLY_CHANNEL_ID", "1554920683786739712").strip(),
@@ -160,7 +164,7 @@ def _load_context_sync(channel_id: str, limit: int, char_budget: int) -> list[di
     with _open_context_db() as conn:
         rows = conn.execute(
             """
-            SELECT author_name, content
+            SELECT author_id, author_name, content
             FROM messages
             WHERE channel_id = ?
             ORDER BY created_at DESC
@@ -173,17 +177,142 @@ def _load_context_sync(channel_id: str, limit: int, char_budget: int) -> list[di
     # character budget is tight, then reverse only for prompt chronology.
     selected_newest: list[dict[str, str]] = []
     used = 0
-    for author_name, content in rows:
+    for author_id, author_name, content in rows:
         text = str(content or "")[:1200]
         cost = len(str(author_name)) + len(text) + 4
         if selected_newest and used + cost > char_budget:
             break
-        selected_newest.append({"name": str(author_name), "content": text})
+        selected_newest.append({"id": str(author_id), "name": str(author_name), "content": text})
         used += cost
         if len(selected_newest) >= limit:
             break
     selected_newest.reverse()
     return selected_newest
+
+
+def _normalize_memory_text(value: str) -> str:
+    value = unicodedata.normalize("NFKD", str(value or "").casefold())
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _memory_tokens(value: str) -> set[str]:
+    normalized = _normalize_memory_text(value)
+    return {
+        token
+        for token in re.findall(r"[a-z0-9_]{3,}", normalized)
+        if token not in {
+            "que", "com", "para", "uma", "por", "isso", "essa", "esse", "voce",
+            "você", "como", "mais", "mas", "nao", "não", "dos", "das", "ele", "ela",
+            "aqui", "agora", "tem", "seu", "sua", "meu", "minha",
+        }
+    }
+
+
+def _load_long_term_context_sync(
+    channel_id: str,
+    current_author_id: str,
+    current_text: str,
+    limit: int,
+    char_budget: int,
+    current_is_self: bool,
+) -> list[dict[str, str]]:
+    """Search the whole persisted channel for memories relevant to this turn."""
+    with _open_context_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT author_id, author_name, content, created_at, is_self
+            FROM messages
+            WHERE channel_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (channel_id, CONTEXT_MAX_ROWS_PER_CHANNEL),
+        ).fetchall()
+
+    current_tokens = _memory_tokens(current_text)
+    preference_markers = (
+        "me chama de", "pode me chamar de", "meu nome e", "meu nome não e",
+        "meu nome nao e", "nao gostei", "não gostei", "nao quero que",
+        "não quero que", "quero que voce", "quero que você", "prefiro",
+        "nao me chama", "não me chama", "nao fale", "não fale", "nao fala",
+        "não fala", "me machucou", "machucou meus sentimentos", "me incomoda",
+        "nao gosto", "não gosto", "melhore no modo", "mude o jeito",
+    )
+
+    scored: list[tuple[float, float, str, str, str]] = []
+    total = max(1, len(rows))
+    for index, (author_id, author_name, content, created_at, is_self) in enumerate(rows):
+        text = str(content or "").strip()
+        if not text:
+            continue
+        normalized = _normalize_memory_text(text)
+        tokens = _memory_tokens(text)
+        overlap = len(current_tokens & tokens)
+        score = float(overlap * 12)
+
+        # Explicit user preferences/corrections are durable memories.
+        if any(marker in normalized for marker in preference_markers):
+            score += 90
+
+        # The same person's history matters a lot, except when Greed itself
+        # triggered the response; then it would mostly retrieve the bot's own text.
+        if not current_is_self and str(author_id) == current_author_id:
+            score += 45
+
+        # Recent history gets a small tie-breaker, but does not erase old preferences.
+        score += max(0.0, 12.0 * (1.0 - (index / total)))
+
+        # Bot messages are useful for continuity, but user statements are stronger memory.
+        if int(is_self or 0):
+            score -= 10
+
+        if score >= 12:
+            scored.append((score, float(created_at or 0), str(author_id), str(author_name), text[:1200]))
+
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+
+    selected: list[tuple[float, str, str, str]] = []
+    used = 0
+    seen: set[tuple[str, str]] = set()
+    for _, created_at, author_id, author_name, text in scored:
+        key = (author_id, text)
+        if key in seen:
+            continue
+        cost = len(author_name) + len(text) + 24
+        if selected and used + cost > char_budget:
+            continue
+        selected.append((created_at, author_id, author_name, text))
+        seen.add(key)
+        used += cost
+        if len(selected) >= limit:
+            break
+
+    selected.sort(key=lambda item: item[0])
+    return [
+        {"id": author_id, "name": author_name, "content": text}
+        for _, author_id, author_name, text in selected
+    ]
+
+
+async def _persistent_long_term_context(message: Any) -> list[dict[str, str]]:
+    channel_id = str(getattr(getattr(message, "channel", None), "id", ""))
+    author = getattr(message, "author", None)
+    author_id = str(getattr(author, "id", ""))
+    current_text = str(getattr(message, "content", "") or "")
+    current_is_self = bool(
+        client.user is not None
+        and getattr(author, "id", None) == getattr(client.user, "id", None)
+    )
+    return await asyncio.to_thread(
+        _load_long_term_context_sync,
+        channel_id,
+        author_id,
+        current_text,
+        CONTEXT_LONGTERM_ITEMS,
+        CONTEXT_LONGTERM_CHARS,
+        current_is_self,
+    )
 
 
 async def _persistent_recent_context(message: Any) -> list[dict[str, str]]:
@@ -220,6 +349,7 @@ async def _persistent_recent_context(message: Any) -> list[dict[str, str]]:
 
 
 auto._recent_context = _persistent_recent_context
+auto._long_term_context_provider = _persistent_long_term_context
 
 # Persist every message seen in the selected context channels, then continue the
 # existing !g / auto-reply message handlers.
@@ -350,7 +480,12 @@ async def _gemini_text_with_key(
     return text
 
 
-def _build_auto_prompt(message: Any, trigger: str | None, context: list[dict[str, str]]) -> tuple[str, str, dict[str, Any]]:
+def _build_auto_prompt(
+    message: Any,
+    trigger: str | None,
+    context: list[dict[str, str]],
+    long_term: list[dict[str, str]],
+) -> tuple[str, str, dict[str, Any]]:
     author_name = getattr(message.author, "display_name", None) or getattr(message.author, "name", "alguém")
     content = (message.content or "").strip()
     profile = auto._reply_profile(content)
@@ -368,7 +503,9 @@ def _build_auto_prompt(message: Any, trigger: str | None, context: list[dict[str
     system = (
         "Você está conversando no Discord pela conta Greed. "
         "Responda em português do Brasil de forma curta, espontânea e informal, como alguém do grupo. "
-        "Use o histórico persistido para manter continuidade, entender referências, números anteriores, piadas e assunto. "
+        "Use o contexto recente e as memórias relevantes do histórico inteiro para manter continuidade, entender referências, pessoas, apelidos, preferências, correções e limites já expressos. "
+        "A mensagem atual tem prioridade; não fique preso em um assunto antigo só porque ele aparece na memória. "
+        "Quando alguém disser que não gostou de uma brincadeira, que algo machucou, ou pedir mudança no modo de falar, trate isso como preferência duradoura daquela mesma pessoa e não repita o padrão ofensivo depois. "
         "Se houver pergunta factual ou matemática, responda corretamente e diretamente antes de brincar. "
         "Se a pessoa disser 'esse número', 'isso', 'agora multiplica', 'o anterior' ou similares, resolva pelo histórico. "
         "Não repita bordões ou respostas recentes. Pode usar kkk/KKKK e emoji ocasionalmente, sem exagerar. "
@@ -381,7 +518,7 @@ def _build_auto_prompt(message: Any, trigger: str | None, context: list[dict[str
                 else "Em conversa casual, use normalmente uma frase curta, no máximo duas. "
             )
         )
-        + "Não diga que é IA, bot ou resposta automática. "
+        + "Nunca diga que é IA, bot, resposta automática, 'só código', 'código e bytes' ou equivalente. "
         "Não invente fatos pessoais, não revele credenciais/tokens/segredos e não faça ameaças reais."
     )
     return prompt, system, profile
@@ -521,6 +658,7 @@ def _reply_is_well_formatted(reply: str, profile: dict[str, Any]) -> bool:
 async def _auto_reply_chain(message: Any, trigger: str | None) -> str:
     """Provider order: Groq -> Gemini key 1 models -> Gemini key 2 models -> NVIDIA -> local."""
     context = await auto._recent_context(message)
+    long_term = await _persistent_long_term_context(message)
 
     if base.GROQ_API_KEY:
         failures_before = int(auto.auto_reply_stats.get("groqFailures", 0))
@@ -532,7 +670,7 @@ async def _auto_reply_chain(message: Any, trigger: str | None) -> str:
             return reply
         print("[ProviderChain] Groq falhou; tentando Gemini 1", flush=True)
 
-    prompt, system, profile = _build_auto_prompt(message, trigger, context)
+    prompt, system, profile = _build_auto_prompt(message, trigger, context, long_term)
 
     result = await _try_gemini_provider(
         "gemini1", GEMINI_API_KEY_1, GEMINI_MODELS_1, prompt, system, int(profile["max_tokens"])
@@ -614,6 +752,9 @@ auto.auto_reply_stats["geminiModels1"] = GEMINI_MODELS_1
 auto.auto_reply_stats["geminiModels2"] = GEMINI_MODELS_2
 auto.auto_reply_stats["contextDbPath"] = CONTEXT_DB_PATH
 auto.auto_reply_stats["contextChannels"] = sorted(CONTEXT_CHANNEL_IDS)
+auto.auto_reply_stats["longTermItems"] = CONTEXT_LONGTERM_ITEMS
+auto.auto_reply_stats["longTermChars"] = CONTEXT_LONGTERM_CHARS
+auto.auto_reply_stats["wholeChatRetrieval"] = True
 
 
 @app.get("/api/context/status", dependencies=[Depends(base.require_api_token)])
