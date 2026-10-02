@@ -373,9 +373,13 @@ def _build_auto_prompt(message: Any, trigger: str | None, context: list[dict[str
         "Se a pessoa disser 'esse número', 'isso', 'agora multiplica', 'o anterior' ou similares, resolva pelo histórico. "
         "Não repita bordões ou respostas recentes. Pode usar kkk/KKKK e emoji ocasionalmente, sem exagerar. "
         + (
-            "Se a mensagem pedir explicação, resposta factual, análise ou código, responda com conteúdo suficiente. Pode usar vários parágrafos, listas e blocos de código e não corte a resposta só para parecer curta. "
-            if profile["detailed"]
-            else "Em conversa casual, use normalmente uma frase curta, no máximo duas. "
+            "Quando o pedido envolver código: SEMPRE use bloco Markdown cercado por três crases e identifique a linguagem, preserve quebras de linha e indentação reais e nunca use crases simples para código multilinha. Se a mensagem atual só mudar a linguagem, como 'quero em python', reutilize o pedido de código imediatamente anterior do histórico e converta/adapte esse mesmo código, sem substituir por um exemplo genérico. Mantenha a resposta completa em aproximadamente 1800 caracteres para caber no Discord. "
+            if profile["kind"] == "code"
+            else (
+                "Se a mensagem pedir explicação, resposta factual ou análise, responda com conteúdo suficiente. Pode usar vários parágrafos e listas e não corte a resposta só para parecer curta. "
+                if profile["detailed"]
+                else "Em conversa casual, use normalmente uma frase curta, no máximo duas. "
+            )
         )
         + "Não diga que é IA, bot ou resposta automática. "
         "Não invente fatos pessoais, não revele credenciais/tokens/segredos e não faça ameaças reais."
@@ -509,6 +513,11 @@ async def _try_nvidia_provider(
     return None
 
 
+def _reply_is_well_formatted(reply: str, profile: dict[str, Any]) -> bool:
+    if profile.get("kind") == "code":
+        return "\x60\x60\x60" in reply
+    return True
+
 async def _auto_reply_chain(message: Any, trigger: str | None) -> str:
     """Provider order: Groq -> Gemini key 1 models -> Gemini key 2 models -> NVIDIA -> local."""
     context = await auto._recent_context(message)
@@ -530,24 +539,27 @@ async def _auto_reply_chain(message: Any, trigger: str | None) -> str:
     )
     if result is not None:
         reply = result[0][: int(profile["max_chars"])]
-        if reply not in auto._recent_bot_replies:
+        if _reply_is_well_formatted(reply, profile) and reply not in auto._recent_bot_replies:
             return reply
+        print("[ProviderChain] Gemini 1 respondeu com formato inválido; tentando Gemini 2", flush=True)
 
     print("[ProviderChain] Gemini 1 indisponível; tentando Gemini 2", flush=True)
     result = await _try_gemini_provider(
         "gemini2", GEMINI_API_KEY_2, GEMINI_MODELS_2, prompt, system, int(profile["max_tokens"])
     )
     if result is not None:
-        reply = result[0][: auto.AUTO_REPLY_MAX_CHARS]
-        if reply not in auto._recent_bot_replies:
+        reply = result[0][: int(profile["max_chars"])]
+        if _reply_is_well_formatted(reply, profile) and reply not in auto._recent_bot_replies:
             return reply
+        print("[ProviderChain] Gemini 2 respondeu com formato inválido; tentando NVIDIA", flush=True)
 
     print("[ProviderChain] Gemini 2 indisponível; tentando NVIDIA", flush=True)
     nvidia_reply = await _try_nvidia_provider(prompt, system, int(profile["max_tokens"]))
     if nvidia_reply is not None:
         reply = nvidia_reply[: int(profile["max_chars"])]
-        if reply not in auto._recent_bot_replies:
+        if _reply_is_well_formatted(reply, profile) and reply not in auto._recent_bot_replies:
             return reply
+        print("[ProviderChain] NVIDIA respondeu com formato inválido; usando fallback local", flush=True)
 
     auto.auto_reply_stats["provider"] = "local"
     auto.auto_reply_stats["providerModel"] = None
@@ -580,7 +592,7 @@ async def _ask_chain(prompt: str) -> str:
         "gemini2", GEMINI_API_KEY_2, GEMINI_MODELS_2, prompt[:4000], system, int(profile["max_tokens"])
     )
     if result is not None:
-        return result[0][:700]
+        return result[0][: int(profile["max_chars"])]
 
     nvidia_reply = await _try_nvidia_provider(prompt[:4000], system, int(profile["max_tokens"]))
     if nvidia_reply is not None:
