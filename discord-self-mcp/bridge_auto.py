@@ -34,6 +34,7 @@ AUTO_REPLY_CONTEXT_CHARS = max(1500, min(24000, int(os.getenv("AUTO_REPLY_CONTEX
 AUTO_REPLY_MAX_CHARS = max(50, min(1500, int(os.getenv("AUTO_REPLY_MAX_CHARS", "450"))))
 AUTO_REPLY_DETAIL_MAX_CHARS = max(AUTO_REPLY_MAX_CHARS, min(6000, int(os.getenv("AUTO_REPLY_DETAIL_MAX_CHARS", "4500"))))
 AUTO_REPLY_CODE_MAX_CHARS = max(AUTO_REPLY_DETAIL_MAX_CHARS, min(12000, int(os.getenv("AUTO_REPLY_CODE_MAX_CHARS", "9000"))))
+AUTO_REPLY_RPG_MAX_CHARS = max(AUTO_REPLY_DETAIL_MAX_CHARS, min(14000, int(os.getenv("AUTO_REPLY_RPG_MAX_CHARS", "10000"))))
 AUTO_REPLY_LONG_MAX_CHARS = AUTO_REPLY_DETAIL_MAX_CHARS
 AUTO_REPLY_ALLOW_SELF = os.getenv("AUTO_REPLY_ALLOW_SELF", "true").strip().lower() in {"1", "true", "yes", "on"}
 GROQ_AUTO_REPLY_MODEL = os.getenv("GROQ_AUTO_REPLY_MODEL", "openai/gpt-oss-120b").strip()
@@ -119,8 +120,22 @@ def _reply_profile(text: str) -> dict[str, Any]:
         or (mentions_code and any(action in normalized for action in code_actions))
         or (looks_like_pasted_code and any(action in normalized for action in code_actions))
     )
-    wants_detail = "?" in text or wants_code or any(marker in normalized for marker in detailed_markers)
+    rpg_strong_markers = (
+        "rpg", "mestre de rpg", "narrador", "ficha de personagem", "campanha",
+        "d20", "turno de combate", "iniciativa", "boss", "chefe final",
+    )
+    rpg_markers = (
+        "jogador", "personagem", "inimigo", "monstro", "vida", " hp ", "hp:",
+        "mana", " mp ", "mp:", "dano", "ataque", "defesa", "armadura",
+        "turno", "dado", "inventario", "habilidade", "magia", "critico",
+        "status", "stamina", "xp", "nivel", "classe", "atributo",
+    )
+    rpg_hits = sum(1 for marker in rpg_markers if marker in f" {normalized} ")
+    wants_rpg = any(marker in normalized for marker in rpg_strong_markers) or rpg_hits >= 2
+    wants_detail = "?" in text or wants_code or wants_rpg or any(marker in normalized for marker in detailed_markers)
 
+    if wants_rpg:
+        return {"kind": "rpg", "detailed": True, "max_tokens": 2600, "max_chars": AUTO_REPLY_RPG_MAX_CHARS}
     if wants_code:
         return {"kind": "code", "detailed": True, "max_tokens": 2200, "max_chars": AUTO_REPLY_CODE_MAX_CHARS}
     if wants_detail:
@@ -316,12 +331,21 @@ async def _generate_reply(message, trigger: str | None) -> str:
     content = (message.content or "").strip()
     context = await _recent_context(message)
     long_term: list[dict[str, str]] = []
+    social_state: dict[str, Any] = {}
     long_term_provider = globals().get("_long_term_context_provider")
     if callable(long_term_provider):
         try:
             long_term = await long_term_provider(message)
         except Exception as exc:
             print(f"[Context] long-term retrieval failed: {type(exc).__name__}: {exc}", flush=True)
+
+    social_provider = globals().get("_social_state_provider")
+    if callable(social_provider):
+        try:
+            social_state = await social_provider(message)
+        except Exception as exc:
+            print(f"[SocialState] retrieval failed: {type(exc).__name__}: {exc}", flush=True)
+
     profile = _reply_profile(content)
     print(
         f"[AutoReply] profile={profile['kind']} max_tokens={profile['max_tokens']} max_chars={profile['max_chars']}",
@@ -339,6 +363,10 @@ async def _generate_reply(message, trigger: str | None) -> str:
         f"[id={row.get('id', '?')}] {row['name']}: {row['content']}" for row in long_term
     )
     recent_replies = "\n".join(f"- {item}" for item in _recent_bot_replies) or "(nenhuma)"
+    social_text = (
+        " | ".join(f"{key}={value}" for key, value in social_state.items())
+        if social_state else "(sem estado social salvo)"
+    )
     user_prompt = (
         f"Servidor Discord: {getattr(getattr(message.channel, 'guild', None), 'name', '')}\n"
         f"Canal: {getattr(message.channel, 'name', str(message.channel.id))}\n"
@@ -347,6 +375,8 @@ async def _generate_reply(message, trigger: str | None) -> str:
         f"{context_text or '(sem contexto recente)'}\n\n"
         f"Memórias relevantes recuperadas do HISTÓRICO INTEIRO do canal:\n"
         f"{long_term_text or '(nenhuma memória antiga relevante)'}\n\n"
+        f"Estado emocional/social do Greed com {author_name} (0-100; é estado do personagem Greed, não diagnóstico da pessoa):\n"
+        f"{social_text}\n\n"
         f"Respostas recentes que VOCÊ já deu e deve evitar repetir:\n{recent_replies}\n\n"
         f"Mensagem atual de {author_name}: {content or '(somente menção)'}"
     )
@@ -365,6 +395,7 @@ async def _generate_reply(message, trigger: str | None) -> str:
                     "Mensagens sem menção também fazem parte do contexto e podem explicar piadas, assunto, pessoas e continuidade. "
                     "Não fique preso em assunto antigo quando a conversa já mudou. Memória antiga é contexto, não obrigação de continuar o tema. "
                     "O estilo do Greed pode ser zoeiro, sarcástico e provocador. Quando a pessoa estiver claramente entrando na brincadeira, zoando de volta, xingando em tom de meme ou provocando, responda na mesma energia ou um pouco mais forte, com criatividade e usando callbacks do histórico quando ficarem engraçados. Evite ficar pedindo desculpa por qualquer provocação leve. "
+                    "Use o estado emocional/social apenas como tendência de personalidade: amizade/confiança altas deixam o Greed mais íntimo e solto; estresse/irritação altos deixam respostas mais secas e provocadoras; tristeza alta deixa o tom mais abatido ou sensível; energia baixa deixa respostas mais cansadas. Não mostre os números espontaneamente, a menos que peçam. "
                     "Se houver um pedido claro para parar a zoação, para não falar mais daquele assunto ou para respeitar um limite específico, respeite esse limite. Não use ameaça real, doxxing, chantagem, incentivo a autoagressão nem ataque baseado em característica protegida. "
                     "Se houver uma pergunta factual ou matemática, responda corretamente e diretamente antes de brincar. "
                     "Se a pessoa usar expressões como 'esse número', 'isso', 'agora multiplica' ou similares, resolva a referência usando a conversa recente. "
@@ -372,12 +403,16 @@ async def _generate_reply(message, trigger: str | None) -> str:
                     "Nunca copie uma das respostas recentes listadas no prompt e evite bordões repetidos. "
                     "Pode usar risadas como kkk/KKKK, deboche, ironia e emoji ocasionalmente. Em conversa de zoeira, prefira uma resposta com punchline em vez de encerrar com 'o que você precisa?' ou tentar mudar para um assunto aleatório. "
                     + (
-                        "Quando o pedido envolver código: SEMPRE escreva o código em bloco Markdown cercado por três crases, informando a linguagem, preserve quebras de linha e indentação reais e nunca coloque código multilinha entre crases simples. Se a mensagem atual só mudar a linguagem, como 'quero em python', reutilize o pedido de código imediatamente anterior do histórico e apenas converta/adapte esse mesmo código; não troque por um exemplo genérico. Se pedirem para deixar maior, realmente expanda o programa. Você pode gerar resposta longa; o sistema divide automaticamente em várias mensagens do Discord. "
-                        if profile["kind"] == "code"
+                        "Em RPG, seja muito mais detalhista e consistente. Separe claramente quando fizer sentido em: 🎭 Narrador, 🧙 Jogador/Personagens, 👹 Inimigos/NPCs e 📊 Estado do combate. Acompanhe HP/vida atual e máxima, mana/MP, stamina se existir, dano bruto, defesa/armadura, dano final, cura, efeitos, buffs/debuffs, cooldowns, iniciativa/turno, inventário e XP quando forem relevantes. Mostre cálculos de dano de forma legível e nunca altere números silenciosamente. O Narrador controla cenário, NPCs e inimigos, mas não decide ações importantes pelo jogador sem pedido. Preserve os valores do histórico; se algum valor não existir, declare claramente o valor inicial assumido. Em cenas sem combate, mantenha descrição rica, consequências, falas e opções de ação. "
+                        if profile["kind"] == "rpg"
                         else (
+                            "Quando o pedido envolver código: SEMPRE escreva o código em bloco Markdown cercado por três crases, informando a linguagem, preserve quebras de linha e indentação reais e nunca coloque código multilinha entre crases simples. Se a mensagem atual só mudar a linguagem, como 'quero em python', reutilize o pedido de código imediatamente anterior do histórico e apenas converta/adapte esse mesmo código; não troque por um exemplo genérico. Se pedirem para deixar maior, realmente expanda o programa. Você pode gerar resposta longa; o sistema divide automaticamente em várias mensagens do Discord. "
+                            if profile["kind"] == "code"
+                            else (
                             "Se a mensagem pedir explicação, resposta factual ou análise, responda com conteúdo suficiente, podendo usar vários parágrafos e listas. Não corte a resposta só para parecer curta. "
-                            if profile["detailed"]
-                            else "Em conversa casual, use normalmente 1 frase curta, no máximo 2. "
+                                if profile["detailed"]
+                                else "Em conversa casual, use normalmente 1 frase curta, no máximo 2. "
+                            )
                         )
                     )
                     + "Nunca diga que é IA, bot, resposta automática, 'só código', 'código e bytes' ou equivalente. "
@@ -596,6 +631,7 @@ async def auto_reply_status() -> dict[str, Any]:
         "casualMaxChars": AUTO_REPLY_MAX_CHARS,
         "detailMaxChars": AUTO_REPLY_DETAIL_MAX_CHARS,
         "codeMaxChars": AUTO_REPLY_CODE_MAX_CHARS,
+        "rpgMaxChars": AUTO_REPLY_RPG_MAX_CHARS,
         "discordChunkChars": 1850,
         "model": GROQ_AUTO_REPLY_MODEL if base.GROQ_API_KEY else None,
         "groqConfigured": bool(base.GROQ_API_KEY),
