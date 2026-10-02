@@ -35,6 +35,11 @@ CONTEXT_PROMPT_MESSAGES = max(10, min(200, int(os.getenv("CONTEXT_PROMPT_MESSAGE
 CONTEXT_PROMPT_CHARS = max(2000, min(50000, int(os.getenv("CONTEXT_PROMPT_CHARS", "18000"))))
 CONTEXT_LONGTERM_ITEMS = max(8, min(60, int(os.getenv("CONTEXT_LONGTERM_ITEMS", "24"))))
 CONTEXT_LONGTERM_CHARS = max(2000, min(24000, int(os.getenv("CONTEXT_LONGTERM_CHARS", "9000"))))
+CONTEXT_BACKFILL_MESSAGES = max(
+    CONTEXT_PROMPT_MESSAGES,
+    min(CONTEXT_MAX_ROWS_PER_CHANNEL, int(os.getenv("CONTEXT_BACKFILL_MESSAGES", "3000"))),
+)
+_backfilled_channels: set[str] = set()
 
 _default_context_channels = [
     os.getenv("AUTO_REPLY_CHANNEL_ID", "1554920683786739712").strip(),
@@ -117,6 +122,52 @@ def _store_row_sync(row: dict[str, Any]) -> None:
             (row["channel_id"], row["channel_id"], CONTEXT_MAX_ROWS_PER_CHANNEL),
         )
         conn.commit()
+
+
+def _store_rows_sync(rows: list[dict[str, Any]]) -> int:
+    valid = [row for row in rows if row.get("message_id") and row.get("channel_id")]
+    if not valid:
+        return 0
+    channel_id = str(valid[-1]["channel_id"])
+    with _open_context_db() as conn:
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO messages (
+                message_id, guild_id, channel_id, author_id, author_name,
+                content, reply_to_message_id, is_self, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["message_id"],
+                    row.get("guild_id", ""),
+                    row["channel_id"],
+                    row.get("author_id", ""),
+                    row.get("author_name", "alguém"),
+                    row.get("content", "")[:4000],
+                    row.get("reply_to_message_id"),
+                    1 if row.get("is_self") else 0,
+                    float(row.get("created_at") or time.time()),
+                )
+                for row in valid
+            ],
+        )
+        cutoff = time.time() - CONTEXT_RETENTION_DAYS * 86400
+        conn.execute("DELETE FROM messages WHERE created_at < ?", (cutoff,))
+        conn.execute(
+            """
+            DELETE FROM messages
+            WHERE channel_id = ? AND message_id NOT IN (
+                SELECT message_id FROM messages
+                WHERE channel_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            )
+            """,
+            (channel_id, channel_id, CONTEXT_MAX_ROWS_PER_CHANNEL),
+        )
+        conn.commit()
+    return len(valid)
 
 
 def _message_to_row(message: Any) -> dict[str, Any] | None:
@@ -315,29 +366,32 @@ async def _persistent_long_term_context(message: Any) -> list[dict[str, str]]:
     )
 
 
-async def _persistent_recent_context(message: Any) -> list[dict[str, str]]:
-    # Seed the DB with Discord history so a fresh volume immediately has useful context.
+async def _ensure_channel_backfill(message: Any) -> None:
+    channel = getattr(message, "channel", None)
+    channel_id = str(getattr(channel, "id", ""))
+    if not channel_id or channel_id in _backfilled_channels:
+        return
+
+    # Mark first to prevent concurrent replies from starting duplicate scans.
+    _backfilled_channels.add(channel_id)
+    rows: list[dict[str, Any]] = []
     try:
-        seed = await _original_recent_context(message)
-        channel_id = str(getattr(getattr(message, "channel", None), "id", ""))
-        guild_id = str(getattr(getattr(message, "guild", None), "id", ""))
-        base_time = time.time() - max(1, len(seed))
-        for index, row in enumerate(seed):
-            pseudo_id = f"seed:{channel_id}:{int(base_time)}:{index}:{hash((row.get('name'), row.get('content')))}"
-            await asyncio.to_thread(
-                _store_row_sync,
-                {
-                    "message_id": pseudo_id,
-                    "guild_id": guild_id,
-                    "channel_id": channel_id,
-                    "author_id": "seed",
-                    "author_name": row.get("name", "alguém"),
-                    "content": row.get("content", ""),
-                    "created_at": base_time + index,
-                },
-            )
+        async for item in channel.history(limit=CONTEXT_BACKFILL_MESSAGES, oldest_first=True):
+            row = _message_to_row(item)
+            if row is not None:
+                rows.append(row)
+        stored = await asyncio.to_thread(_store_rows_sync, rows)
+        print(
+            f"[Context] whole-chat backfill channel={channel_id} scanned={len(rows)} stored={stored}",
+            flush=True,
+        )
     except Exception as exc:
-        print(f"[Context] seed failed: {type(exc).__name__}: {exc}", flush=True)
+        _backfilled_channels.discard(channel_id)
+        print(f"[Context] whole-chat backfill failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+async def _persistent_recent_context(message: Any) -> list[dict[str, str]]:
+    await _ensure_channel_backfill(message)
 
     channel_id = str(getattr(getattr(message, "channel", None), "id", ""))
     return await asyncio.to_thread(
@@ -755,6 +809,7 @@ auto.auto_reply_stats["contextChannels"] = sorted(CONTEXT_CHANNEL_IDS)
 auto.auto_reply_stats["longTermItems"] = CONTEXT_LONGTERM_ITEMS
 auto.auto_reply_stats["longTermChars"] = CONTEXT_LONGTERM_CHARS
 auto.auto_reply_stats["wholeChatRetrieval"] = True
+auto.auto_reply_stats["backfillMessages"] = CONTEXT_BACKFILL_MESSAGES
 
 
 @app.get("/api/context/status", dependencies=[Depends(base.require_api_token)])
