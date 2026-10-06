@@ -11,15 +11,30 @@ const DEFAULT_VOICE_CHANNEL_ID = process.env.DEFAULT_VOICE_CHANNEL_ID || '153037
 const COOKIE_NAME = 'assistir_session';
 const COOKIE_TTL = 60 * 60 * 12;
 
-const child = spawn(process.execPath, ['src/index.js'], {
-  cwd: process.cwd(),
-  env: { ...process.env, PORT: String(INTERNAL_MCP_PORT) },
-  stdio: 'inherit'
-});
+let child = null;
+let childRestartCount = 0;
+let childRestartTimer = null;
+let shuttingDown = false;
 
-child.on('exit', (code, signal) => {
-  console.error(`[Launcher] internal MCP exited code=${code} signal=${signal || ''}`);
-});
+function startInternalMcp() {
+  child = spawn(process.execPath, ['src/index.js'], {
+    cwd: process.cwd(),
+    env: { ...process.env, PORT: String(INTERNAL_MCP_PORT) },
+    stdio: 'inherit'
+  });
+  const startedAt = Date.now();
+  child.on('exit', (code, signal) => {
+    console.error(`[Launcher] internal MCP exited code=${code} signal=${signal || ''}`);
+    if (shuttingDown) return;
+    childRestartCount += 1;
+    const livedMs = Date.now() - startedAt;
+    const delay = livedMs > 60_000 ? 1_000 : Math.min(30_000, 1_000 * 2 ** Math.min(childRestartCount, 5));
+    console.error(`[Launcher] restarting internal MCP in ${delay}ms (restart #${childRestartCount})`);
+    childRestartTimer = setTimeout(startInternalMcp, delay);
+  });
+}
+
+startInternalMcp();
 
 function safeEqual(a, b) {
   const aa = Buffer.from(String(a ?? ''));
@@ -118,6 +133,26 @@ function proxyToInternal(req, res) {
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+
+    if (url.pathname === '/health' && req.method === 'GET') {
+      return json(res, 200, {
+        ok: true,
+        service: 'meu-discord-launcher',
+        internalMcpRunning: Boolean(child && child.exitCode === null && !child.killed),
+        internalMcpRestarts: childRestartCount
+      });
+    }
+
+    if (url.pathname === '/ready' && req.method === 'GET') {
+      try {
+        const response = await fetch(`http://127.0.0.1:${INTERNAL_MCP_PORT}/ready`, { signal: AbortSignal.timeout(2500) });
+        const body = await response.json();
+        return json(res, response.ok ? 200 : 503, { ok: response.ok, internal: body, internalMcpRestarts: childRestartCount });
+      } catch (error) {
+        return json(res, 503, { ok: false, error: error.message, internalMcpRestarts: childRestartCount });
+      }
+    }
+
     if (!url.pathname.startsWith('/assistir')) return proxyToInternal(req, res);
 
     if (url.pathname === '/assistir/login' && req.method === 'POST') {
@@ -192,7 +227,9 @@ server.listen(PUBLIC_PORT, '0.0.0.0', () => {
 });
 
 function shutdown() {
-  try { child.kill('SIGTERM'); } catch {}
+  shuttingDown = true;
+  if (childRestartTimer) clearTimeout(childRestartTimer);
+  try { child?.kill('SIGTERM'); } catch {}
   try { server.close(); } catch {}
 }
 process.once('SIGTERM', shutdown);
