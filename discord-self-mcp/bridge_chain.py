@@ -41,6 +41,22 @@ CONTEXT_BACKFILL_MESSAGES = max(
 )
 _backfilled_channels: set[str] = set()
 
+# Durable memory mirror (Supabase). SQLite stays as a fast local cache.
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "").strip()
+SUPABASE_BOT_SECRET = os.getenv("SUPABASE_BOT_SECRET", "").strip()
+SUPABASE_SYNC_ENABLED = bool(SUPABASE_URL and SUPABASE_ANON_KEY and SUPABASE_BOT_SECRET)
+SUPABASE_SYNC_TIMEOUT = max(2.0, min(20.0, float(os.getenv("SUPABASE_SYNC_TIMEOUT", "6"))))
+_supabase_stats: dict[str, Any] = {
+    "enabled": SUPABASE_SYNC_ENABLED,
+    "messageWrites": 0,
+    "socialWrites": 0,
+    "reads": 0,
+    "failures": 0,
+    "lastError": None,
+    "lastSyncAt": None,
+}
+
 _default_context_channels = [
     os.getenv("AUTO_REPLY_CHANNEL_ID", "1554920683786739712").strip(),
     os.getenv("G_COMMAND_CHANNEL_ID", "1554920170659774545").strip(),
@@ -50,6 +66,127 @@ CONTEXT_CHANNEL_IDS = {
     for item in os.getenv("CONTEXT_CHANNEL_IDS", ",".join(_default_context_channels)).split(",")
     if item.strip()
 }
+
+
+def _supabase_headers(prefer: str | None = None) -> dict[str, str]:
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "x-bot-secret": SUPABASE_BOT_SECRET,
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
+def _supabase_request_sync(
+    method: str,
+    table: str,
+    *,
+    params: dict[str, str] | None = None,
+    payload: Any = None,
+    prefer: str | None = None,
+) -> Any:
+    if not SUPABASE_SYNC_ENABLED:
+        return None
+    try:
+        with httpx.Client(timeout=SUPABASE_SYNC_TIMEOUT) as http:
+            response = http.request(
+                method,
+                f"{SUPABASE_URL}/rest/v1/{table}",
+                headers=_supabase_headers(prefer),
+                params=params,
+                json=payload,
+            )
+        if response.is_error:
+            raise RuntimeError(f"Supabase HTTP {response.status_code}: {response.text[:240]}")
+        _supabase_stats["lastError"] = None
+        _supabase_stats["lastSyncAt"] = time.time()
+        if not response.content:
+            return None
+        return response.json()
+    except Exception as exc:
+        _supabase_stats["failures"] = int(_supabase_stats.get("failures", 0)) + 1
+        _supabase_stats["lastError"] = f"{type(exc).__name__}: {exc}"[:500]
+        print(f"[SupabaseMemory] {method} {table} failed: {type(exc).__name__}: {exc}", flush=True)
+        return None
+
+
+def _supabase_store_messages_sync(rows: list[dict[str, Any]]) -> None:
+    if not SUPABASE_SYNC_ENABLED or not rows:
+        return
+    payload = [
+        {
+            "message_id": str(row.get("message_id") or ""),
+            "guild_id": str(row.get("guild_id") or ""),
+            "channel_id": str(row.get("channel_id") or ""),
+            "author_id": str(row.get("author_id") or ""),
+            "author_name": str(row.get("author_name") or "alguém"),
+            "content": str(row.get("content") or "")[:4000],
+            "reply_to_message_id": row.get("reply_to_message_id"),
+            "is_self": bool(row.get("is_self")),
+            "created_at": float(row.get("created_at") or time.time()),
+        }
+        for row in rows
+        if row.get("message_id") and row.get("channel_id")
+    ]
+    for offset in range(0, len(payload), 200):
+        chunk = payload[offset:offset + 200]
+        result = _supabase_request_sync(
+            "POST",
+            "discord_messages",
+            params={"on_conflict": "message_id"},
+            payload=chunk,
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
+        if result is not None or _supabase_stats.get("lastError") is None:
+            _supabase_stats["messageWrites"] = int(_supabase_stats.get("messageWrites", 0)) + len(chunk)
+
+
+def _supabase_get_social_state_sync(guild_id: str, user_id: str) -> dict[str, Any] | None:
+    result = _supabase_request_sync(
+        "GET",
+        "discord_social_states",
+        params={
+            "select": "guild_id,user_id,user_name,friendship,trust,respect,stress,sadness,irritation,energy,interactions,updated_at",
+            "guild_id": f"eq.{guild_id}",
+            "user_id": f"eq.{user_id}",
+            "limit": "1",
+        },
+    )
+    if isinstance(result, list) and result:
+        _supabase_stats["reads"] = int(_supabase_stats.get("reads", 0)) + 1
+        return result[0]
+    return None
+
+
+def _supabase_upsert_social_state_sync(guild_id: str, user_id: str, state: dict[str, Any]) -> None:
+    if not SUPABASE_SYNC_ENABLED:
+        return
+    payload = {
+        "guild_id": guild_id,
+        "user_id": user_id,
+        "user_name": str(state.get("userName") or "alguém"),
+        "friendship": int(state.get("friendship", 50)),
+        "trust": int(state.get("trust", 50)),
+        "respect": int(state.get("respect", 50)),
+        "stress": int(state.get("stress", 10)),
+        "sadness": int(state.get("sadness", 5)),
+        "irritation": int(state.get("irritation", 5)),
+        "energy": int(state.get("energy", 70)),
+        "interactions": int(state.get("interactions", 0)),
+        "updated_at": time.time(),
+    }
+    _supabase_request_sync(
+        "POST",
+        "discord_social_states",
+        params={"on_conflict": "guild_id,user_id"},
+        payload=payload,
+        prefer="resolution=merge-duplicates,return=minimal",
+    )
+    if _supabase_stats.get("lastError") is None:
+        _supabase_stats["socialWrites"] = int(_supabase_stats.get("socialWrites", 0)) + 1
 
 
 def _open_context_db() -> sqlite3.Connection:
@@ -141,6 +278,7 @@ def _store_row_sync(row: dict[str, Any]) -> None:
             (row["channel_id"], row["channel_id"], CONTEXT_MAX_ROWS_PER_CHANNEL),
         )
         conn.commit()
+    _supabase_store_messages_sync([row])
 
 
 def _store_rows_sync(rows: list[dict[str, Any]]) -> int:
@@ -186,6 +324,7 @@ def _store_rows_sync(rows: list[dict[str, Any]]) -> int:
             (channel_id, channel_id, CONTEXT_MAX_ROWS_PER_CHANNEL),
         )
         conn.commit()
+    _supabase_store_messages_sync(valid)
     return len(valid)
 
 
@@ -258,6 +397,17 @@ def _get_social_state_sync(guild_id: str, user_id: str, user_name: str = "") -> 
             """,
             (guild_id, user_id),
         ).fetchone()
+
+    if row is None:
+        remote_state = _supabase_get_social_state_sync(guild_id, user_id)
+        if remote_state:
+            row = (
+                remote_state.get("friendship", 50), remote_state.get("trust", 50),
+                remote_state.get("respect", 50), remote_state.get("stress", 10),
+                remote_state.get("sadness", 5), remote_state.get("irritation", 5),
+                remote_state.get("energy", 70), remote_state.get("interactions", 0),
+                remote_state.get("user_name") or user_name,
+            )
 
     if row is None:
         state = {
@@ -405,6 +555,7 @@ def _update_social_state_sync(row: dict[str, Any]) -> dict[str, Any]:
             ),
         )
         conn.commit()
+    _supabase_upsert_social_state_sync(guild_id, user_id, state)
     return state
 
 
@@ -1069,6 +1220,7 @@ auto.auto_reply_stats["backfillMessages"] = CONTEXT_BACKFILL_MESSAGES
 auto.auto_reply_stats["socialStateEnabled"] = True
 auto.auto_reply_stats["socialMeters"] = ["friendship", "trust", "respect", "stress", "sadness", "irritation", "energy"]
 auto.auto_reply_stats["rpgDetailedMode"] = True
+auto.auto_reply_stats["durableMemory"] = "supabase" if SUPABASE_SYNC_ENABLED else "local-only"
 
 
 @app.get("/api/context/status", dependencies=[Depends(base.require_api_token)])
@@ -1087,6 +1239,7 @@ async def context_status() -> dict[str, Any]:
             "maxRowsPerChannel": CONTEXT_MAX_ROWS_PER_CHANNEL,
             "promptMessages": CONTEXT_PROMPT_MESSAGES,
             "promptChars": CONTEXT_PROMPT_CHARS,
+            "supabase": dict(_supabase_stats),
         }
 
     return await asyncio.to_thread(stats)
