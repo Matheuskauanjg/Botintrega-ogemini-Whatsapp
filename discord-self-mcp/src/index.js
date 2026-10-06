@@ -22,17 +22,32 @@ const AUTH_CODE_TTL_MS = 5 * 60 * 1000;
 const oauthCodes = new Map();
 const requestContext = new AsyncLocalStorage();
 
-const python = spawn(process.env.PYTHON_BIN || 'python3', [
-  '-m', 'uvicorn', `${BRIDGE_APP_MODULE}:app`, '--host', '127.0.0.1', '--port', String(BRIDGE_PORT)
-], {
-  cwd: process.cwd(),
-  env: process.env,
-  stdio: 'inherit'
-});
+let python = null;
+let pythonRestartCount = 0;
+let pythonRestartTimer = null;
+let shuttingDown = false;
 
-python.on('exit', (code, signal) => {
-  console.error(`[DiscordBridge] Python process exited code=${code} signal=${signal || ''}`);
-});
+function startPythonBridge() {
+  python = spawn(process.env.PYTHON_BIN || 'python3', [
+    '-m', 'uvicorn', `${BRIDGE_APP_MODULE}:app`, '--host', '127.0.0.1', '--port', String(BRIDGE_PORT)
+  ], {
+    cwd: process.cwd(),
+    env: process.env,
+    stdio: 'inherit'
+  });
+  const startedAt = Date.now();
+  python.on('exit', (code, signal) => {
+    console.error(`[DiscordBridge] Python process exited code=${code} signal=${signal || ''}`);
+    if (shuttingDown) return;
+    pythonRestartCount += 1;
+    const livedMs = Date.now() - startedAt;
+    const delay = livedMs > 60_000 ? 1_000 : Math.min(30_000, 1_000 * 2 ** Math.min(pythonRestartCount, 5));
+    console.error(`[DiscordBridge] restarting Python bridge in ${delay}ms (restart #${pythonRestartCount})`);
+    pythonRestartTimer = setTimeout(startPythonBridge, delay);
+  });
+}
+
+startPythonBridge();
 
 function base64url(value) {
   return Buffer.from(value).toString('base64url');
@@ -355,13 +370,33 @@ const mcpNodeHandler = toNodeHandler(mcpHandler, {
 const app = express();
 app.set('trust proxy', true);
 
-app.get('/health', async (_req, res) => {
+app.get('/health', (_req, res) => {
+  res.json({
+    ok: true,
+    service: 'meu-discord-mcp',
+    pythonRunning: Boolean(python && python.exitCode === null && !python.killed),
+    pythonRestarts: pythonRestartCount
+  });
+});
+
+app.get('/ready', async (_req, res) => {
   try {
-    const response = await fetch(`${BRIDGE_BASE}/health`);
+    const response = await fetch(`${BRIDGE_BASE}/health`, { signal: AbortSignal.timeout(2500) });
     const payload = await response.json();
-    res.status(response.ok ? 200 : 503).json({ ok: response.ok, bridge: payload });
+    const ready = Boolean(response.ok && payload?.discordReady && payload?.tokenConfigured);
+    res.status(ready ? 200 : 503).json({
+      ok: ready,
+      pythonRunning: Boolean(python && python.exitCode === null && !python.killed),
+      pythonRestarts: pythonRestartCount,
+      bridge: payload
+    });
   } catch (error) {
-    res.status(503).json({ ok: false, error: error.message });
+    res.status(503).json({
+      ok: false,
+      pythonRunning: Boolean(python && python.exitCode === null && !python.killed),
+      pythonRestarts: pythonRestartCount,
+      error: error.message
+    });
   }
 });
 
@@ -546,8 +581,10 @@ app.listen(PUBLIC_PORT, '0.0.0.0', () => {
 });
 
 async function cleanup() {
+  shuttingDown = true;
+  if (pythonRestartTimer) clearTimeout(pythonRestartTimer);
   try { await mcpHandler.close(); } catch (_) {}
-  try { python.kill('SIGTERM'); } catch (_) {}
+  try { python?.kill('SIGTERM'); } catch (_) {}
 }
 
 process.once('SIGTERM', cleanup);
