@@ -8,6 +8,7 @@ import * as z from 'zod/v4';
 
 const PUBLIC_PORT = Number(process.env.PORT || 10000);
 const BRIDGE_PORT = Number(process.env.BRIDGE_INTERNAL_PORT || 10001);
+const BRIDGE_APP_MODULE = process.env.BRIDGE_APP_MODULE || 'bridge_chain';
 const API_TOKEN = process.env.API_TOKEN || '';
 const LOGIN_SECRET = process.env.MCP_LOGIN_SECRET || API_TOKEN || '';
 const CLIENT_ID = process.env.MCP_CLIENT_ID || 'chatgpt-meu-discord';
@@ -22,7 +23,7 @@ const oauthCodes = new Map();
 const requestContext = new AsyncLocalStorage();
 
 const python = spawn(process.env.PYTHON_BIN || 'python3', [
-  '-m', 'uvicorn', 'bridge:app', '--host', '127.0.0.1', '--port', String(BRIDGE_PORT)
+  '-m', 'uvicorn', `${BRIDGE_APP_MODULE}:app`, '--host', '127.0.0.1', '--port', String(BRIDGE_PORT)
 ], {
   cwd: process.cwd(),
   env: process.env,
