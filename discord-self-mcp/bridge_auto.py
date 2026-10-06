@@ -37,11 +37,13 @@ AUTO_REPLY_CODE_MAX_CHARS = max(AUTO_REPLY_DETAIL_MAX_CHARS, min(12000, int(os.g
 AUTO_REPLY_RPG_MAX_CHARS = max(AUTO_REPLY_DETAIL_MAX_CHARS, min(14000, int(os.getenv("AUTO_REPLY_RPG_MAX_CHARS", "10000"))))
 AUTO_REPLY_LONG_MAX_CHARS = AUTO_REPLY_DETAIL_MAX_CHARS
 AUTO_REPLY_ALLOW_SELF = os.getenv("AUTO_REPLY_ALLOW_SELF", "true").strip().lower() in {"1", "true", "yes", "on"}
+AUTO_REPLY_MAX_CONCURRENT = max(1, min(4, int(os.getenv("AUTO_REPLY_MAX_CONCURRENT", "2"))))
 GROQ_AUTO_REPLY_MODEL = os.getenv("GROQ_AUTO_REPLY_MODEL", "openai/gpt-oss-120b").strip()
 
 _last_reply_at: dict[tuple[int, int], float] = defaultdict(float)
 _last_seen_message: dict[tuple[int, int, str], float] = {}
 _recent_bot_replies: deque[str] = deque(maxlen=12)
+_generation_semaphore = asyncio.Semaphore(AUTO_REPLY_MAX_CONCURRENT)
 auto_reply_stats: dict[str, Any] = {
     "matched": 0,
     "replied": 0,
@@ -53,6 +55,9 @@ auto_reply_stats: dict[str, Any] = {
     "lastTrigger": None,
     "lastReplyAt": None,
     "lastModelError": None,
+    "activeGenerations": 0,
+    "peakConcurrentGenerations": 0,
+    "lastGenerationMs": None,
 }
 
 
@@ -590,7 +595,23 @@ async def on_message(message) -> None:
     await asyncio.sleep(random.uniform(0.35, 0.95))
 
     try:
-        reply = await _generate_reply(message, trigger)
+        generation_started = time.perf_counter()
+        async with _generation_semaphore:
+            auto_reply_stats["activeGenerations"] = int(auto_reply_stats.get("activeGenerations", 0)) + 1
+            auto_reply_stats["peakConcurrentGenerations"] = max(
+                int(auto_reply_stats.get("peakConcurrentGenerations", 0)),
+                int(auto_reply_stats["activeGenerations"]),
+            )
+            try:
+                typing = getattr(message.channel, "typing", None)
+                if callable(typing):
+                    async with typing():
+                        reply = await _generate_reply(message, trigger)
+                else:
+                    reply = await _generate_reply(message, trigger)
+            finally:
+                auto_reply_stats["activeGenerations"] = max(0, int(auto_reply_stats.get("activeGenerations", 1)) - 1)
+                auto_reply_stats["lastGenerationMs"] = round((time.perf_counter() - generation_started) * 1000)
         chunks = _split_discord_reply(reply)
         if not chunks:
             raise RuntimeError("empty reply after Discord splitting")
@@ -626,6 +647,7 @@ async def auto_reply_status() -> dict[str, Any]:
         "allowSelfTrigger": AUTO_REPLY_ALLOW_SELF,
         "cooldownSeconds": AUTO_REPLY_COOLDOWN_SECONDS,
         "duplicateWindowSeconds": AUTO_REPLY_DUPLICATE_WINDOW_SECONDS,
+        "maxConcurrentGenerations": AUTO_REPLY_MAX_CONCURRENT,
         "maxContextMessages": AUTO_REPLY_MAX_CONTEXT,
         "contextCharBudget": AUTO_REPLY_CONTEXT_CHARS,
         "casualMaxChars": AUTO_REPLY_MAX_CHARS,
