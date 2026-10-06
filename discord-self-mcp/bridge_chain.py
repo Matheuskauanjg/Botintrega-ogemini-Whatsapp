@@ -144,6 +144,24 @@ def _supabase_store_messages_sync(rows: list[dict[str, Any]]) -> None:
             _supabase_stats["messageWrites"] = int(_supabase_stats.get("messageWrites", 0)) + len(chunk)
 
 
+def _supabase_load_messages_sync(channel_id: str, limit: int = 1000) -> list[dict[str, Any]]:
+    result = _supabase_request_sync(
+        "GET",
+        "discord_messages",
+        params={
+            "select": "message_id,guild_id,channel_id,author_id,author_name,content,reply_to_message_id,is_self,created_at",
+            "channel_id": f"eq.{channel_id}",
+            "order": "created_at.desc",
+            "limit": str(max(1, min(1000, limit))),
+        },
+    )
+    if isinstance(result, list):
+        _supabase_stats["reads"] = int(_supabase_stats.get("reads", 0)) + 1
+        result.reverse()
+        return result
+    return []
+
+
 def _supabase_get_social_state_sync(guild_id: str, user_id: str) -> dict[str, Any] | None:
     result = _supabase_request_sync(
         "GET",
@@ -743,6 +761,14 @@ async def _ensure_channel_backfill(message: Any) -> None:
     _backfilled_channels.add(channel_id)
     rows: list[dict[str, Any]] = []
     try:
+        restored = await asyncio.to_thread(
+            _supabase_load_messages_sync,
+            channel_id,
+            min(1000, CONTEXT_MAX_ROWS_PER_CHANNEL),
+        )
+        if restored:
+            await asyncio.to_thread(_store_rows_sync, restored)
+            print(f"[SupabaseMemory] restored channel={channel_id} messages={len(restored)}", flush=True)
         async for item in channel.history(limit=CONTEXT_BACKFILL_MESSAGES, oldest_first=True):
             row = _message_to_row(item)
             if row is not None:
