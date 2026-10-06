@@ -998,12 +998,15 @@ async def _try_gemini_provider(
         if not _model_available(provider, model):
             continue
         try:
+            attempt_started = time.perf_counter()
+            auto.auto_reply_stats["lastProviderAttempt"] = {"provider": provider, "model": model}
             text = await _gemini_text_with_key(api_key, model, prompt, system, max_output_tokens)
             auto.auto_reply_stats["provider"] = provider
             auto.auto_reply_stats["providerModel"] = model
             auto.auto_reply_stats[f"{provider}Replies"] = int(auto.auto_reply_stats.get(f"{provider}Replies", 0)) + 1
             auto.auto_reply_stats["lastModelError"] = None
-            print(f"[ProviderChain] success provider={provider} model={model}", flush=True)
+            auto.auto_reply_stats["lastProviderLatencyMs"] = round((time.perf_counter() - attempt_started) * 1000)
+            print(f"[ProviderChain] success provider={provider} model={model} latencyMs={auto.auto_reply_stats['lastProviderLatencyMs']}", flush=True)
             return text, model
         except OutputLimitError as exc:
             auto.auto_reply_stats[f"{provider}Failures"] = int(auto.auto_reply_stats.get(f"{provider}Failures", 0)) + 1
@@ -1086,12 +1089,15 @@ async def _try_nvidia_provider(
     if not _model_available("nvidia", NVIDIA_MODEL):
         return None
     try:
+        attempt_started = time.perf_counter()
+        auto.auto_reply_stats["lastProviderAttempt"] = {"provider": "nvidia", "model": NVIDIA_MODEL}
         text = await _nvidia_text(prompt, system, max_output_tokens)
         auto.auto_reply_stats["provider"] = "nvidia"
         auto.auto_reply_stats["providerModel"] = NVIDIA_MODEL
         auto.auto_reply_stats["nvidiaReplies"] = int(auto.auto_reply_stats.get("nvidiaReplies", 0)) + 1
         auto.auto_reply_stats["lastModelError"] = None
-        print(f"[ProviderChain] success provider=nvidia model={NVIDIA_MODEL}", flush=True)
+        auto.auto_reply_stats["lastProviderLatencyMs"] = round((time.perf_counter() - attempt_started) * 1000)
+        print(f"[ProviderChain] success provider=nvidia model={NVIDIA_MODEL} latencyMs={auto.auto_reply_stats['lastProviderLatencyMs']}", flush=True)
         return text
     except OutputLimitError as exc:
         auto.auto_reply_stats["nvidiaFailures"] = int(auto.auto_reply_stats.get("nvidiaFailures", 0)) + 1
@@ -1123,11 +1129,14 @@ async def _auto_reply_chain(message: Any, trigger: str | None) -> str:
 
     if base.GROQ_API_KEY:
         failures_before = int(auto.auto_reply_stats.get("groqFailures", 0))
+        groq_started = time.perf_counter()
+        auto.auto_reply_stats["lastProviderAttempt"] = {"provider": "groq", "model": auto.GROQ_AUTO_REPLY_MODEL}
         reply = await _original_auto_generate(message, trigger)
         failures_after = int(auto.auto_reply_stats.get("groqFailures", 0))
         if failures_after == failures_before:
             auto.auto_reply_stats["provider"] = "groq"
             auto.auto_reply_stats["providerModel"] = auto.GROQ_AUTO_REPLY_MODEL
+            auto.auto_reply_stats["lastProviderLatencyMs"] = round((time.perf_counter() - groq_started) * 1000)
             return reply
         print("[ProviderChain] Groq falhou; tentando Gemini 1", flush=True)
 
@@ -1204,6 +1213,8 @@ auto._generate_reply = _auto_reply_chain
 fun._ask_groq = _ask_chain
 
 auto.auto_reply_stats["providerOrder"] = ["groq", "gemini1", "gemini2", "nvidia", "local"]
+auto.auto_reply_stats["lastProviderLatencyMs"] = None
+auto.auto_reply_stats["lastProviderAttempt"] = None
 auto.auto_reply_stats["gemini1Configured"] = bool(GEMINI_API_KEY_1)
 auto.auto_reply_stats["gemini2Configured"] = bool(GEMINI_API_KEY_2)
 auto.auto_reply_stats["nvidiaConfigured"] = bool(NVIDIA_API_KEY)
