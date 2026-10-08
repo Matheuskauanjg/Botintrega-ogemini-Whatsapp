@@ -1,0 +1,28 @@
+name: Greed bridge checks
+
+on:
+  push:
+    branches:
+      - discord-self
+      - fix/greed-social-performance-20261008
+    paths:
+      - "discord-self-mcp/**"
+      - ".github/workflows/discord-greed-check.yml"
+  pull_request:
+    paths:
+      - "discord-self-mcp/**"
+      - ".github/workflows/discord-greed-check.yml"
+  workflow_dispatch:
+
+jobs:
+  syntax-and-unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Python syntax validation
+        run: python -m compileall -q discord-self-mcp
+      - name: Unit tests
+        run: python -m unittest discover -s discord-self-mcp -p 'test_*.py' -v

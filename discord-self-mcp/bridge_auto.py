@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 from fastapi import Depends
+from greed_persona import dogao_guidance
 
 import bridge_download as stack
 
@@ -21,7 +22,7 @@ client = base.client
 
 AUTO_REPLY_ENABLED = os.getenv("AUTO_REPLY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 AUTO_REPLY_GUILD_ID = os.getenv("AUTO_REPLY_GUILD_ID", "1251266361569710222").strip()
-AUTO_REPLY_CHANNEL_ID = os.getenv("AUTO_REPLY_CHANNEL_ID", "1251266362014302248").strip()
+AUTO_REPLY_CHANNEL_ID = os.getenv("AUTO_REPLY_CHANNEL_ID", "1554920683786739712").strip()
 AUTO_REPLY_TRIGGERS = [
     item.casefold().strip()
     for item in os.getenv("AUTO_REPLY_TRIGGERS", "grade,greed").split(",")
@@ -427,6 +428,8 @@ async def _generate_reply(message, trigger: str | None) -> str:
             {"role": "user", "content": user_prompt},
         ],
     }
+
+    payload["messages"][0]["content"] += dogao_guidance(author_name, str(getattr(message.author, "id", "")), content)
 
     try:
         async with httpx.AsyncClient(timeout=25) as http:

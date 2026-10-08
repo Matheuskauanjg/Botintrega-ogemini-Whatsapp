@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 from fastapi import Depends
+from greed_persona import dogao_guidance
 
 import bridge_gprefix as stack
 
@@ -846,17 +847,14 @@ NVIDIA_MODEL = os.getenv(
     "NVIDIA_MODEL", "nvidia/nemotron-3.5-lightning-30b-a3b"
 ).strip()
 
+# Order observed working models first; custom lists remain configurable via env.
 _DEFAULT_MODELS = [
     "gemini-3.1-flash-lite",
     "gemini-3.5-flash-lite",
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash",
-    "gemini-3-flash-preview",
-    "gemini-2.5-flash-lite",
     "gemini-2.5-flash",
 ]
+GEMINI_MAX_ATTEMPTS = max(1, min(5, int(os.getenv("GEMINI_MAX_ATTEMPTS", "2"))))
+GEMINI_HTTP_TIMEOUT_SECONDS = max(5.0, min(30.0, float(os.getenv("GEMINI_HTTP_TIMEOUT_SECONDS", "16"))))
 
 
 def _parse_models(env_name: str) -> list[str]:
@@ -890,7 +888,7 @@ def _set_model_cooldown(provider: str, model: str, status: int) -> None:
     elif status in {400, 403, 404}:
         seconds = 21600
     elif status in {500, 502, 503, 504}:
-        seconds = 20
+        seconds = 120
     else:
         seconds = 60
     _model_cooldowns[f"{provider}:{model}"] = time.monotonic() + seconds
@@ -917,7 +915,7 @@ async def _gemini_text_with_key(
         ],
         "generationConfig": {"maxOutputTokens": max_output_tokens},
     }
-    async with httpx.AsyncClient(timeout=30) as http:
+    async with httpx.AsyncClient(timeout=GEMINI_HTTP_TIMEOUT_SECONDS) as http:
         response = await http.post(
             url,
             headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
@@ -1007,6 +1005,7 @@ def _build_auto_prompt(
         + "Nunca diga que é IA, bot, resposta automática, 'só código', 'código e bytes' ou equivalente. "
         "Não invente fatos pessoais, não revele credenciais/tokens/segredos e não faça ameaças reais."
     )
+    system += dogao_guidance(author_name, str(getattr(message.author, "id", "")), content)
     return prompt, system, profile
 
 
@@ -1020,9 +1019,13 @@ async def _try_gemini_provider(
 ) -> tuple[str, str] | None:
     if not api_key:
         return None
+    attempts = 0
     for model in models:
         if not _model_available(provider, model):
             continue
+        if attempts >= GEMINI_MAX_ATTEMPTS:
+            break
+        attempts += 1
         try:
             attempt_started = time.perf_counter()
             auto.auto_reply_stats["lastProviderAttempt"] = {"provider": provider, "model": model}
@@ -1035,6 +1038,8 @@ async def _try_gemini_provider(
             print(f"[ProviderChain] success provider={provider} model={model} latencyMs={auto.auto_reply_stats['lastProviderLatencyMs']}", flush=True)
             return text, model
         except OutputLimitError as exc:
+            # Re-trying the same exhausted model immediately slows down every reply.
+            _model_cooldowns[f"{provider}:{model}"] = time.monotonic() + 90
             auto.auto_reply_stats[f"{provider}Failures"] = int(auto.auto_reply_stats.get(f"{provider}Failures", 0)) + 1
             auto.auto_reply_stats["lastModelError"] = str(exc)[:700]
             print(f"[ProviderChain] output limit provider={provider} model={model}; next model", flush=True)
@@ -1247,6 +1252,9 @@ auto.auto_reply_stats["nvidiaConfigured"] = bool(NVIDIA_API_KEY)
 auto.auto_reply_stats["nvidiaModel"] = NVIDIA_MODEL
 auto.auto_reply_stats["adaptiveLength"] = True
 auto.auto_reply_stats["geminiModels1"] = GEMINI_MODELS_1
+auto.auto_reply_stats["geminiMaxAttempts"] = GEMINI_MAX_ATTEMPTS
+auto.auto_reply_stats["geminiHttpTimeoutSeconds"] = GEMINI_HTTP_TIMEOUT_SECONDS
+auto.auto_reply_stats["dogaoFlirtEnabled"] = os.getenv("DOGAO_FLIRT_ENABLED", "true").strip().lower() not in {"0", "false", "off", "no"}
 auto.auto_reply_stats["geminiModels2"] = GEMINI_MODELS_2
 auto.auto_reply_stats["contextDbPath"] = CONTEXT_DB_PATH
 auto.auto_reply_stats["contextChannels"] = sorted(CONTEXT_CHANNEL_IDS)
