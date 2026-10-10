@@ -18,7 +18,8 @@ GROQ_TRANSCRIBE_MODEL = os.getenv("GROQ_TRANSCRIBE_MODEL", "whisper-large-v3-tur
 GROQ_TRANSCRIBE_LANGUAGE = os.getenv("GROQ_TRANSCRIBE_LANGUAGE", "pt").strip()
 MAX_MEDIA_BYTES = int(os.getenv("MAX_MEDIA_BYTES", str(10 * 1024 * 1024)))
 
-client = discord.Client()
+DISCORD_MAX_CACHED_MESSAGES = max(100, min(500, int(os.getenv("DISCORD_MAX_CACHED_MESSAGES", "100"))))
+client = discord.Client(max_messages=DISCORD_MAX_CACHED_MESSAGES)
 ready_event = asyncio.Event()
 discord_task: asyncio.Task | None = None
 last_client_error: str | None = None
@@ -52,22 +53,48 @@ async def run_discord() -> None:
         print("[Discord] DISCORD_USER_TOKEN not configured; bridge will stay online in disconnected mode.", flush=True)
         return
     try:
-        await client.start(DISCORD_USER_TOKEN)
+        await client.start(DISCORD_USER_TOKEN, reconnect=True)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         last_client_error = f"{type(exc).__name__}: {exc}"
         ready_event.clear()
         print(f"[Discord] Client failed: {last_client_error}", flush=True)
+        # The Node supervisor restarts the bridge after a fatal login/gateway error.
+        # Do not silently keep HTTP alive with a permanently dead Discord task.
+        os._exit(1)
+
+
+async def discord_watchdog() -> None:
+    # Discord may briefly disconnect normally; restart only after a prolonged outage.
+    disconnected_since = None
+    while True:
+        await asyncio.sleep(30)
+        if not DISCORD_USER_TOKEN:
+            continue
+        if client.is_ready():
+            disconnected_since = None
+        else:
+            if disconnected_since is None:
+                disconnected_since = asyncio.get_running_loop().time()
+            elif asyncio.get_running_loop().time() - disconnected_since > 240:
+                print("[Discord] gateway unavailable for >240s; restarting bridge", flush=True)
+                os._exit(1)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global discord_task
     discord_task = asyncio.create_task(run_discord())
+    watchdog_task = asyncio.create_task(discord_watchdog())
     try:
         yield
     finally:
+        watchdog_task.cancel()
+        try:
+            await watchdog_task
+        except asyncio.CancelledError:
+            pass
         if not client.is_closed():
             try:
                 await client.close()
