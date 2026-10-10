@@ -574,7 +574,7 @@ def _update_social_state_sync(row: dict[str, Any]) -> dict[str, Any]:
             ),
         )
         conn.commit()
-    _supabase_upsert_social_state_sync(guild_id, user_id, state)
+    # Remote upserts happen in the bounded background writer.
     return state
 
 
@@ -800,35 +800,72 @@ auto._recent_context = _persistent_recent_context
 auto._long_term_context_provider = _persistent_long_term_context
 auto._social_state_provider = _social_state_for_message
 
-# Persist every message seen in the selected context channels, then continue the
-# existing !g / auto-reply message handlers.
+# Do not block Discord event handlers while Supabase/SQLite are slow.
+# A single bounded worker batches message persistence and coalesces social states.
+# This also bounds memory consumption if the remote database is unavailable.
+CONTEXT_WRITE_QUEUE_SIZE = max(32, min(1024, int(os.getenv("CONTEXT_WRITE_QUEUE_SIZE", "256"))))
+CONTEXT_WRITE_BATCH_SIZE = max(1, min(100, int(os.getenv("CONTEXT_WRITE_BATCH_SIZE", "32"))))
+_context_write_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=CONTEXT_WRITE_QUEUE_SIZE)
+_context_write_worker: asyncio.Task | None = None
+_context_dropped = 0
 _previous_on_message_chain = client.on_message
+
+
+async def _context_write_loop() -> None:
+    while True:
+        first = await _context_write_queue.get()
+        batch = [first]
+        while len(batch) < CONTEXT_WRITE_BATCH_SIZE:
+            try:
+                batch.append(_context_write_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        try:
+            channel_rows: dict[str, list[dict[str, Any]]] = {}
+            for item in batch:
+                channel_rows.setdefault(str(item["channel_id"]), []).append(item)
+            for rows in channel_rows.values():
+                try:
+                    await asyncio.to_thread(_store_rows_sync, rows)
+                except Exception as exc:
+                    print(f"[Context] batch store failed: {type(exc).__name__}: {exc}", flush=True)
+
+            latest_states: dict[tuple[str, str], dict[str, Any]] = {}
+            for item in batch:
+                if item.get("is_self") or item.get("author_is_bot"):
+                    continue
+                try:
+                    state = await asyncio.to_thread(_update_social_state_sync, item)
+                    if state:
+                        latest_states[(str(item["guild_id"]), str(item["author_id"]))] = state
+                except Exception as exc:
+                    print(f"[SocialState] update failed: {type(exc).__name__}: {exc}", flush=True)
+            # Only the latest state per user is sent to Supabase per batch.
+            for (guild_id, user_id), state in latest_states.items():
+                await asyncio.to_thread(_supabase_upsert_social_state_sync, guild_id, user_id, state)
+        except Exception as exc:
+            print(f"[Context] worker failure: {type(exc).__name__}: {exc}", flush=True)
+        finally:
+            for _ in batch:
+                _context_write_queue.task_done()
 
 
 @client.event
 async def on_message(message: Any) -> None:
+    global _context_write_worker, _context_dropped
     row = _message_to_row(message)
     if row is not None:
-        try:
-            await asyncio.to_thread(_store_row_sync, row)
-        except Exception as exc:
-            print(f"[Context] store failed: {type(exc).__name__}: {exc}", flush=True)
-
         author = getattr(message, "author", None)
-        is_bot = bool(getattr(author, "bot", False))
-        if not row.get("is_self") and not is_bot:
-            try:
-                state = await asyncio.to_thread(_update_social_state_sync, row)
-                if state:
-                    print(
-                        f"[SocialState] user={row.get('author_id')} friendship={state['friendship']} "
-                        f"stress={state['stress']} sadness={state['sadness']} "
-                        f"irritation={state['irritation']} mood={state['mood']}",
-                        flush=True,
-                    )
-            except Exception as exc:
-                print(f"[SocialState] update failed: {type(exc).__name__}: {exc}", flush=True)
-
+        row["author_is_bot"] = bool(getattr(author, "bot", False))
+        if _context_write_worker is None or _context_write_worker.done():
+            _context_write_worker = asyncio.create_task(_context_write_loop(), name="discord-context-writer")
+        try:
+            _context_write_queue.put_nowait(row)
+        except asyncio.QueueFull:
+            _context_dropped += 1
+            if _context_dropped == 1 or _context_dropped % 50 == 0:
+                print(f"[Context] write queue full, dropped={_context_dropped}", flush=True)
+    # Auto-reply and !g handlers must never wait for database/network writes.
     await _previous_on_message_chain(message)
 
 
@@ -1285,6 +1322,9 @@ async def context_status() -> dict[str, Any]:
             "promptMessages": CONTEXT_PROMPT_MESSAGES,
             "promptChars": CONTEXT_PROMPT_CHARS,
             "supabase": dict(_supabase_stats),
+            "queuePending": _context_write_queue.qsize(),
+            "queueMax": CONTEXT_WRITE_QUEUE_SIZE,
+            "queueDropped": _context_dropped,
         }
 
     return await asyncio.to_thread(stats)
