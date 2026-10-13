@@ -1,7 +1,18 @@
 """Offline regression tests for contextual image generation (no API calls)."""
 import base64
+import importlib.util
+import sys
+import types
 import unittest
 from types import SimpleNamespace
+
+# CI runs dependency-free unit tests; API calls are not made here.
+for module_name in ("discord", "httpx", "fastapi"):
+    if importlib.util.find_spec(module_name) is None:
+        fake = types.ModuleType(module_name)
+        if module_name == "fastapi":
+            fake.Depends = lambda dependency: dependency
+        sys.modules[module_name] = fake
 
 import bridge_draw as draw
 
