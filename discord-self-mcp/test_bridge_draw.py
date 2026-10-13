@@ -5,6 +5,7 @@ import sys
 import types
 import unittest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 # CI runs dependency-free unit tests; API calls are not made here.
 for module_name in ("discord", "httpx", "fastapi"):
@@ -12,6 +13,8 @@ for module_name in ("discord", "httpx", "fastapi"):
         fake = types.ModuleType(module_name)
         if module_name == "fastapi":
             fake.Depends = lambda dependency: dependency
+        if module_name == "httpx":
+            fake.HTTPError = OSError
         sys.modules[module_name] = fake
 
 import bridge_draw as draw
@@ -66,6 +69,69 @@ class DrawTests(unittest.TestCase):
         self.assertIn("espadas", prompt)
         self.assertNotIn("minhatestepass123", prompt)
         self.assertNotIn("https://example.com/segredo", prompt)
+
+
+    def test_nvidia_sd3_payload(self):
+        url, payload = draw._nvidia_request("stabilityai/stable-diffusion-3-medium", "draw a dragon")
+        self.assertTrue(url.endswith("/stabilityai/stable-diffusion-3-medium"))
+        self.assertEqual(payload["prompt"], "draw a dragon")
+        self.assertEqual(payload["mode"], "text-to-image")
+        self.assertEqual(payload["output_format"], "jpeg")
+
+    def test_nvidia_flux_payload(self):
+        url, payload = draw._nvidia_request("black-forest-labs/flux.2-klein-4b", "draw a dragon")
+        self.assertTrue(url.endswith("/black-forest-labs/flux.2-klein-4b"))
+        self.assertEqual(payload["mode"], "Image Generation")
+        self.assertEqual(payload["height"], 1024)
+        self.assertEqual(payload["samples"], 1)
+
+    def test_nvidia_artifact_base64(self):
+        image = b"\xff\xd8\xff\xdbjpeg bytes"
+        response = SimpleNamespace(
+            headers={"content-type": "application/json"},
+            json=lambda: {"artifacts": [
+                {"finishReason": "SUCCESS", "base64": base64.b64encode(image).decode()}
+            ]},
+        )
+        self.assertEqual(draw._extract_nvidia_image(response), (image, "jpg"))
+
+    def test_nvidia_binary_image(self):
+        image = b"\x89PNG\r\n\x1a\nimage bytes"
+        response = SimpleNamespace(
+            headers={"content-type": "image/png"}, content=image
+        )
+        self.assertEqual(draw._extract_nvidia_image(response), (image, "png"))
+
+    def test_nvidia_reject_invalid_model(self):
+        with self.assertRaises(ValueError):
+            draw._nvidia_request("unknown/untrusted", "test")
+
+
+class ProviderOrderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_nvidia_first_success(self):
+        nvidia = AsyncMock(return_value=(b"nvidia_image", "jpg"))
+        gemini = AsyncMock(return_value=(b"gemini_image", "png"))
+        with patch.object(draw, "_generate_image_nvidia", nvidia), patch.object(draw, "_generate_image_gemini", gemini):
+            result = await draw._generate_image("draw this")
+        self.assertEqual(result, (b"nvidia_image", "jpg", "NVIDIA"))
+        nvidia.assert_awaited_once()
+        gemini.assert_not_awaited()
+
+    async def test_fallback_to_gemini(self):
+        nvidia = AsyncMock(side_effect=RuntimeError("NVIDIA unavailable"))
+        gemini = AsyncMock(return_value=(b"gemini_image", "png"))
+        with patch.object(draw, "_generate_image_nvidia", nvidia), patch.object(draw, "_generate_image_gemini", gemini):
+            result = await draw._generate_image("draw this")
+        self.assertEqual(result, (b"gemini_image", "png", "Gemini"))
+        nvidia.assert_awaited_once()
+        gemini.assert_awaited_once()
+
+    async def test_both_providers_fail(self):
+        nvidia = AsyncMock(side_effect=RuntimeError("NVIDIA unavailable"))
+        gemini = AsyncMock(side_effect=RuntimeError("Gemini unavailable"))
+        with patch.object(draw, "_generate_image_nvidia", nvidia), patch.object(draw, "_generate_image_gemini", gemini):
+            with self.assertRaisesRegex(RuntimeError, "NVIDIA e Gemini falharam"):
+                await draw._generate_image("draw this")
 
 
 if __name__ == "__main__":
