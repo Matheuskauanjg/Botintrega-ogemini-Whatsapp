@@ -22,6 +22,12 @@ NVIDIA_IMAGE_MODEL = os.getenv(
     "NVIDIA_IMAGE_MODEL", "stabilityai/stable-diffusion-3-medium"
 ).strip()
 NVIDIA_API_BASE = "https://ai.api.nvidia.com/v1/genai"
+NVIDIA_IMAGE_FALLBACK_MODEL = os.getenv(
+    "NVIDIA_IMAGE_FALLBACK_MODEL", "black-forest-labs/flux.1-schnell"
+).strip()
+STATUS_COMMAND_RE = re.compile(
+    r"^\s*!(?:desenho|desenhar|draw)\s+status\s*$", re.IGNORECASE
+)
 AUTO_EVERY = max(3, int(os.getenv("DRAW_AUTO_EVERY_REPLIES", "12")))
 COOLDOWN = max(60, int(os.getenv("DRAW_COOLDOWN_SECONDS", "3600")))
 DAILY_LIMIT = max(1, min(20, int(os.getenv("DRAW_DAILY_LIMIT", "4"))))
@@ -144,6 +150,20 @@ def _nvidia_request(model: str, prompt: str) -> tuple[str, dict[str, Any]]:
                 "seed": 0,
             },
         )
+    if model == "black-forest-labs/flux.1-schnell":
+        return (
+            f"{NVIDIA_API_BASE}/{model}",
+            {
+                "prompt": prompt[:9500],
+                "mode": "base",
+                "height": 1024,
+                "width": 1024,
+                "cfg_scale": 0,
+                "samples": 1,
+                "seed": 0,
+                "steps": 4,
+            },
+        )
     if model == "black-forest-labs/flux.2-klein-4b":
         return (
             f"{NVIDIA_API_BASE}/{model}",
@@ -211,32 +231,64 @@ def _extract_nvidia_image(response: Any) -> tuple[bytes, str]:
     raise RuntimeError("NVIDIA não retornou uma imagem base64 utilizável")
 
 
+def _error_hint(status: int) -> str:
+    """Safe, actionable hints without echoing provider response bodies."""
+    return {
+        400: "requisição recusada",
+        401: "chave inválida",
+        402: "pagamento ou créditos necessários",
+        403: "modelo sem permissão",
+        404: "modelo ou endpoint indisponível",
+        408: "tempo limite",
+        413: "prompt muito grande",
+        422: "parâmetros incompatíveis",
+        429: "cota ou limite de chamadas",
+        500: "erro interno do provedor",
+        502: "provedor indisponível",
+        503: "provedor indisponível",
+        504: "tempo limite do provedor",
+    }.get(status, "erro do provedor")
+
+
+def _nvidia_models() -> list[str]:
+    models = [NVIDIA_IMAGE_MODEL, NVIDIA_IMAGE_FALLBACK_MODEL]
+    return list(dict.fromkeys(model for model in models if model))
+
+
 async def _generate_image_nvidia(prompt: str) -> tuple[bytes, str]:
     keys = _nvidia_keys()
     if not keys:
-        raise RuntimeError("NVIDIA_IMAGE_API_KEY/NVIDIA_API_KEY ausente")
-    url, payload = _nvidia_request(NVIDIA_IMAGE_MODEL, prompt)
+        raise RuntimeError("chave NVIDIA não configurada")
     errors: list[str] = []
     async with httpx.AsyncClient(timeout=120.0) as http:
-        for key in keys:
+        for model in _nvidia_models():
             try:
-                response = await http.post(
-                    url,
-                    headers={
-                        "Authorization": f"Bearer {key}",
-                        "Accept": "application/json, image/*",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                )
-                if response.status_code != 200:
-                    errors.append(f"HTTP {response.status_code}")
-                    continue
-                return _extract_nvidia_image(response)
-            except (httpx.HTTPError, ValueError, RuntimeError) as exc:
-                errors.append(type(exc).__name__)
-    raise RuntimeError("falha NVIDIA Image: " + ", ".join(errors))
-
+                url, payload = _nvidia_request(model, prompt)
+            except ValueError as exc:
+                errors.append(f"{model}: configuração de modelo inválida")
+                continue
+            for key in keys:
+                try:
+                    response = await http.post(
+                        url,
+                        headers={
+                            "Authorization": f"Bearer {key}",
+                            "Accept": "application/json, image/*",
+                            "Content-Type": "application/json",
+                        },
+                        json=payload,
+                    )
+                    if response.status_code != 200:
+                        errors.append(
+                            f"{model}: HTTP {response.status_code} ({_error_hint(response.status_code)})"
+                        )
+                        continue
+                    data, ext = _extract_nvidia_image(response)
+                    stats["lastNvidiaModelUsed"] = model
+                    return data, ext
+                except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+                    errors.append(f"{model}: {type(exc).__name__}")
+    raise RuntimeError("; ".join(errors[-4:]) or "NVIDIA não disponível")
 
 async def _generate_image_gemini(prompt: str) -> tuple[bytes, str]:
     keys = _gemini_keys()
@@ -255,7 +307,7 @@ async def _generate_image_gemini(prompt: str) -> tuple[bytes, str]:
                     IMAGE_URL, headers={"x-goog-api-key": key}, json=payload
                 )
                 if resp.status_code != 200:
-                    errors.append(f"HTTP {resp.status_code}")
+                    errors.append(f"HTTP {resp.status_code} ({_error_hint(resp.status_code)})")
                     continue
                 return _extract_image(resp.json())
             except (httpx.HTTPError, ValueError, RuntimeError) as exc:
@@ -272,14 +324,38 @@ async def _generate_image(prompt: str) -> tuple[bytes, str, str]:
         return data, ext, "NVIDIA"
     except (httpx.HTTPError, ValueError, RuntimeError) as exc:
         stats["lastNvidiaError"] = f"{type(exc).__name__}: {exc}"[:200]
-        print(f"[Draw] NVIDIA image unavailable: {type(exc).__name__}", flush=True)
+        print(f"[Draw] NVIDIA image unavailable: {stats['lastNvidiaError']}", flush=True)
 
     try:
         data, ext = await _generate_image_gemini(prompt)
         return data, ext, "Gemini"
     except (httpx.HTTPError, ValueError, RuntimeError) as exc:
         stats["lastGeminiError"] = f"{type(exc).__name__}: {exc}"[:200]
+        print(f"[Draw] Gemini image unavailable: {stats['lastGeminiError']}", flush=True)
         raise RuntimeError("NVIDIA e Gemini falharam na geração de imagem") from exc
+
+def _diagnostic_message() -> str:
+    def reason(value: str | None) -> str:
+        if not value:
+            return "não testado"
+        if "não configurada" in value or "ausente" in value:
+            return "chave ausente"
+        codes = re.findall(r"HTTP (\\d{3})", value)
+        if codes:
+            return ", ".join(f"HTTP {code}: {_error_hint(int(code))}" for code in dict.fromkeys(codes))
+        if "timeout" in value.lower():
+            return "tempo limite"
+        return "falha de geração, veja /api/drawing/status ou Render Logs"
+
+    return (
+        "🎨 **Diagnóstico de imagem**\\n"
+        f"NVIDIA: {'chave encontrada' if _nvidia_keys() else 'chave ausente'} — "
+        f"{reason(stats['lastNvidiaError'])}\\n"
+        f"Gemini: {'chave encontrada' if _gemini_keys() else 'chave ausente'} — "
+        f"{reason(stats['lastGeminiError'])}\\n"
+        f"Último sucesso: {stats['lastProvider'] or 'nenhum'}"
+    )
+
 
 def install(client: Any, app: Any, context_provider: Any, require_api_token: Any) -> None:
     """Register a lightweight event wrapper without interrupting existing replies."""
@@ -341,7 +417,7 @@ def install(client: Any, app: Any, context_provider: Any, require_api_token: Any
                 print(f"[Draw] failed: {stats['lastError']}", flush=True)
                 if manual:
                     try:
-                        await message.channel.send("🎨 Não consegui gerar a imagem. Verifique NVIDIA/Gemini e os logs do Render.")
+                        await message.channel.send(_diagnostic_message())
                     except Exception:
                         pass
 
@@ -361,6 +437,10 @@ def install(client: Any, app: Any, context_provider: Any, require_api_token: Any
             and str(getattr(getattr(message, "channel", None), "id", "")) == CHANNEL_ID
         )
         if ENABLED and in_channel and author is not None:
+            if STATUS_COMMAND_RE.match(content):
+                await message.channel.send(_diagnostic_message())
+                await previous_on_message(message)
+                return
             match = COMMAND_RE.match(content)
             if match:
                 enqueue(message, match.group(1).strip(), manual=True)
@@ -385,6 +465,7 @@ def install(client: Any, app: Any, context_provider: Any, require_api_token: Any
             "enabled": ENABLED, "autoEnabled": AUTO_ENABLED,
             "guildId": GUILD_ID, "channelId": CHANNEL_ID,
             "model": MODEL, "nvidiaImageModel": NVIDIA_IMAGE_MODEL,
+            "nvidiaFallbackModel": NVIDIA_IMAGE_FALLBACK_MODEL,
             "nvidiaConfigured": bool(_nvidia_keys()),
             "geminiConfigured": bool(_gemini_keys()),
             "apiKeyConfigured": bool(_nvidia_keys() or _gemini_keys()),
