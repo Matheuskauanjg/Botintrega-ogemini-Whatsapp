@@ -54,7 +54,6 @@ def _keys() -> list[str]:
 
 def _context_prompt(rows: list[dict[str, str]], message: Any, request: str) -> str:
     lines = []
-    bot_id = str(getattr(getattr(message, "_state", None), "user", None) or "")
     for row in rows[-30:]:
         name = str(row.get("name", "alguém"))[:32]
         text = SECRET_RE.sub("[omitido]", str(row.get("content", "")))
@@ -85,17 +84,21 @@ def _extract_image(payload: dict[str, Any]) -> tuple[bytes, str]:
     interaction = payload.get("interaction") or payload
     block = interaction.get("output_image") or interaction.get("outputImage")
     if not block:
-        # The REST API may return multimodal blocks within steps instead.
+        # v1beta REST returns steps[type=model_output].content[type=image].
         for step in reversed(interaction.get("steps") or []):
-            candidates = step.get("output") or step.get("outputs") or []
-            if isinstance(candidates, dict):
-                candidates = [candidates]
-            for item in reversed(candidates):
-                if isinstance(item, dict):
-                    block = item.get("image") or item.get("imageContent") or item.get("inlineData") or item.get("inline_data")
-                    if block:
-                        break
+            if step.get("type") != "model_output":
+                continue
+            for item in reversed(step.get("content") or []):
+                if isinstance(item, dict) and item.get("type") == "image":
+                    block = item
+                    break
             if block:
+                break
+    if not block:
+        # Compatibility with the former Interactions API response format.
+        for item in reversed(interaction.get("outputs") or []):
+            if isinstance(item, dict) and item.get("type") == "image":
+                block = item
                 break
     if not isinstance(block, dict):
         raise RuntimeError("resposta do modelo sem imagem")
@@ -109,7 +112,6 @@ def _extract_image(payload: dict[str, Any]) -> tuple[bytes, str]:
     if not raw or len(raw) > MAX_BYTES:
         raise RuntimeError("imagem vazia ou maior que 8 MB")
     return raw, "jpg" if mime == "image/jpeg" else mime.split("/")[-1]
-
 
 async def _generate_image(prompt: str) -> tuple[bytes, str]:
     keys = _keys()
