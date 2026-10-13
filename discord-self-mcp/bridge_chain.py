@@ -1344,3 +1344,9 @@ async def social_state_status(user_id: str) -> dict[str, Any]:
         "state": state,
         "note": "Os medidores representam o estado/personagem do Greed em relação ao membro, não um diagnóstico psicológico do membro.",
     }
+
+
+# Contextual illustration mode: installs after every existing Discord handler.
+import bridge_draw as drawing  # noqa: E402
+
+drawing.install(client, app, _persistent_recent_context, base.require_api_token)
