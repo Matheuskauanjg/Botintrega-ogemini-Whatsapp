@@ -107,6 +107,40 @@ class DrawTests(unittest.TestCase):
             draw._nvidia_request("unknown/untrusted", "test")
 
 
+    def test_nvidia_flux_schnell(self):
+        url, payload = draw._nvidia_request("black-forest-labs/flux.1-schnell", "lobao drawing")
+        self.assertTrue(url.endswith("/black-forest-labs/flux.1-schnell"))
+        self.assertEqual(payload["mode"], "base")
+        self.assertEqual(payload["steps"], 4)
+
+    def test_nvidia_model_fallback_order(self):
+        with patch.object(draw, "NVIDIA_IMAGE_MODEL", "stabilityai/stable-diffusion-3-medium"), \
+             patch.object(draw, "NVIDIA_IMAGE_FALLBACK_MODEL", "black-forest-labs/flux.1-schnell"):
+            self.assertEqual(draw._nvidia_models(), [
+                "stabilityai/stable-diffusion-3-medium",
+                "black-forest-labs/flux.1-schnell",
+            ])
+
+    def test_drawing_status_command(self):
+        self.assertIsNotNone(draw.STATUS_COMMAND_RE.match("!desenho status"))
+        self.assertIsNotNone(draw.STATUS_COMMAND_RE.match("!draw status"))
+        self.assertIsNone(draw.STATUS_COMMAND_RE.match("!desenhar uma montanha"))
+
+    def test_diagnostics_show_only_safe_status(self):
+        with patch.dict(draw.stats, {
+            "lastNvidiaError": "SD3: HTTP 403 (token_secreto_que_nao_deve_aparecer)",
+            "lastGeminiError": "HTTP 429 cota",
+            "lastProvider": None,
+        }):
+            with patch.object(draw, "_nvidia_keys", return_value=["secret"]), \
+                 patch.object(draw, "_gemini_keys", return_value=["secret"]):
+                result = draw._diagnostic_message()
+        self.assertIn("HTTP 403", result)
+        self.assertIn("HTTP 429", result)
+        self.assertNotIn("token_secreto", result)
+        self.assertIn("\n", result)
+
+
 class ProviderOrderTests(unittest.IsolatedAsyncioTestCase):
     async def test_nvidia_first_success(self):
         nvidia = AsyncMock(return_value=(b"nvidia_image", "jpg"))
@@ -132,6 +166,36 @@ class ProviderOrderTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(draw, "_generate_image_nvidia", nvidia), patch.object(draw, "_generate_image_gemini", gemini):
             with self.assertRaisesRegex(RuntimeError, "NVIDIA e Gemini falharam"):
                 await draw._generate_image("draw this")
+
+
+    async def test_nvidia_retries_fallback_model_after_http_403(self):
+        import base64
+        from types import SimpleNamespace
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                return None
+            async def post(self, url, **kwargs):
+                if url.endswith("stable-diffusion-3-medium"):
+                    return SimpleNamespace(status_code=403)
+                return SimpleNamespace(
+                    status_code=200,
+                    headers={"content-type": "application/json"},
+                    json=lambda: {"artifacts": [
+                        {"base64": base64.b64encode(b"image result").decode()}
+                    ]},
+                )
+
+        with patch.object(draw, "_nvidia_keys", return_value=["test_key"]), \
+             patch.object(draw, "NVIDIA_IMAGE_MODEL", "stabilityai/stable-diffusion-3-medium"), \
+             patch.object(draw, "NVIDIA_IMAGE_FALLBACK_MODEL", "black-forest-labs/flux.1-schnell"), \
+             patch.object(draw.httpx, "AsyncClient", FakeClient, create=True):
+            result = await draw._generate_image_nvidia("draw a character")
+        self.assertEqual(result, (b"image result", "jpg"))
 
 
 if __name__ == "__main__":
