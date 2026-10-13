@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 from fastapi import Depends
 from greed_persona import dogao_guidance
+from bridge_draw import COMMAND_RE as DRAW_COMMAND_RE
 
 import bridge_download as stack
 
@@ -563,15 +564,13 @@ async def on_message(message) -> None:
         auto_reply_stats["skippedChannel"] += 1
         return
 
-    # Drawing requests are handled by bridge_draw; never send a duplicate text reply.
-    if os.getenv("DRAW_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}:
-        if re.match(
-            r"^\s*(?:<@!?\d+>|greed|grade|lob[aã]o)[,:]?\s+"
-            r"(?:desenha|desenhe|ilustra|ilustre|faz(?:a)?\s+(?:um\s+)?desenho)\b",
-            message.content or "",
-            flags=re.IGNORECASE,
-        ):
-            return
+    # A drawing request must never trigger a text-only auto-reply.
+    # Reuse the exact parser installed by the image handler.
+    if (
+        os.getenv("DRAW_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+        and DRAW_COMMAND_RE.match(message.content or "")
+    ):
+        return
 
     matched, trigger = _trigger_match(message)
     if not matched:
