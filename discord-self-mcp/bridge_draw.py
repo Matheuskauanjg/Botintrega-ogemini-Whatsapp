@@ -340,7 +340,7 @@ def _diagnostic_message() -> str:
             return "não testado"
         if "não configurada" in value or "ausente" in value:
             return "chave ausente"
-        codes = re.findall(r"HTTP (\\d{3})", value)
+        codes = re.findall(r"HTTP (\d{3})", value)
         if codes:
             return ", ".join(f"HTTP {code}: {_error_hint(int(code))}" for code in dict.fromkeys(codes))
         if "timeout" in value.lower():
@@ -348,11 +348,11 @@ def _diagnostic_message() -> str:
         return "falha de geração, veja /api/drawing/status ou Render Logs"
 
     return (
-        "🎨 **Diagnóstico de imagem**\\n"
+        "🎨 **Diagnóstico de imagem**\n"
         f"NVIDIA: {'chave encontrada' if _nvidia_keys() else 'chave ausente'} — "
-        f"{reason(stats['lastNvidiaError'])}\\n"
+        f"{reason(stats['lastNvidiaError'])}\n"
         f"Gemini: {'chave encontrada' if _gemini_keys() else 'chave ausente'} — "
-        f"{reason(stats['lastGeminiError'])}\\n"
+        f"{reason(stats['lastGeminiError'])}\n"
         f"Último sucesso: {stats['lastProvider'] or 'nenhum'}"
     )
 
