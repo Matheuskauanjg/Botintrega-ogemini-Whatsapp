@@ -563,6 +563,16 @@ async def on_message(message) -> None:
         auto_reply_stats["skippedChannel"] += 1
         return
 
+    # Drawing requests are handled by bridge_draw; never send a duplicate text reply.
+    if os.getenv("DRAW_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}:
+        if re.match(
+            r"^\s*(?:<@!?\d+>|greed|grade|lob[aã]o)[,:]?\s+"
+            r"(?:desenha|desenhe|ilustra|ilustre|faz(?:a)?\s+(?:um\s+)?desenho)\b",
+            message.content or "",
+            flags=re.IGNORECASE,
+        ):
+            return
+
     matched, trigger = _trigger_match(message)
     if not matched:
         return
