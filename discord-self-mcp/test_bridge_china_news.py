@@ -1,11 +1,29 @@
 """Testes offline do coletor (sem login Discord nem chamadas à internet)."""
-import os
+import importlib
+import sys
 import tempfile
+import types
 import unittest
 from datetime import datetime, timezone
 from email.utils import format_datetime
 from pathlib import Path
 from unittest.mock import patch
+
+# A suíte geral do repositório não instala dependências de runtime. Para os
+# testes offline, simula apenas os símbolos externos necessários ao import.
+for module_name in ("discord", "httpx", "fastapi"):
+    try:
+        importlib.import_module(module_name)
+    except ModuleNotFoundError:
+        stub = types.ModuleType(module_name)
+        if module_name == "httpx":
+            stub.AsyncClient = type("AsyncClient", (), {})
+            stub.HTTPError = Exception
+        elif module_name == "fastapi":
+            stub.Depends = lambda dependency: dependency
+        elif module_name == "discord":
+            stub.File = lambda *args, **kwargs: None
+        sys.modules[module_name] = stub
 
 import bridge_china_news as news
 
