@@ -35,3 +35,18 @@ O agendador roda somente enquanto o processo \`meu-discord\` estiver ativo. Hosp
 Acesse \`GET /api/china-news/status\` no servidor bridge (interno), com \`Authorization: Bearer <API_TOKEN>\`. O endpoint informa configuração, última publicação, tentativa, notícia e erro. No log do serviço, busque \`[ChinaNews]\`.
 
 > **Aviso do Discord:** automatizar contas pessoais (selfbots) contraria os Termos de Serviço da plataforma e pode levar a suspensão da conta. Para uma operação de longo prazo, recomenda-se migrar o publicador para um bot oficial com token de aplicação.
+
+## Comando manual
+
+Digite no **servidor configurado**:
+
+- \`!noticia\` — publica imediatamente a próxima categoria do rodízio.
+- \`!noticia nacional\` — notícia nacional chinesa.
+- \`!noticia provincia\` (ou \`!noticia província\`) — notícia de província chinesa.
+- \`!noticia fofoca\` — notícia sobre entretenimento, celebridades ou fofocas.
+
+O comando publica no canal de notícias configurado, independentemente do canal onde for enviado, e responde com um link para a mensagem criada. Pula a espera de duas horas, mas **não repete matérias** e não ignora a exigência de imagem, fonte e tradução. Um novo envio manual só pode começar após 30 segundos, por padrão. A publicação manual também reinicia a contagem de 2 horas da rotina.
+
+Por segurança, apenas a própria conta conectada ou os IDs relacionados em \`CHINA_NEWS_ADMIN_IDS\` podem ativá-lo. Os demais comandos do Greed são preservados.
+
+Variáveis opcionais: \`CHINA_NEWS_GUILD_ID=1251266361569710222\`, \`CHINA_NEWS_ADMIN_IDS=123456789012345678\` (vários separados por vírgula), \`CHINA_NEWS_MANUAL_COOLDOWN_SECONDS=30\`.
