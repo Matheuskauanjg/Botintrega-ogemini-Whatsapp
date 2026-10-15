@@ -1,14 +1,14 @@
 # Boletim da China — Discord
 
-Serviço instalado automaticamente pelo módulo \`bridge_chain.py\` do \`discord-self-mcp\`.
+Serviço instalado automaticamente pelo módulo `bridge_chain.py` do `discord-self-mcp`.
 
 ## Funcionamento
 
 - **Canal:** https://discord.com/channels/1251266361569710222/1560415874114920559
 - **Intervalo:** 2 horas após a última notícia publicada com sucesso.
-- **Rotatividade:** notícias nacionais (\`国内\`), regionais (\`地方\`, alternando províncias) e celebridades/fofocas (\`娱乐\`).
+- **Rotatividade:** notícias nacionais (`国内`), regionais (`地方`, alternando províncias) e celebridades/fofocas (`娱乐`).
 - **Fontes:** pesquisas RSS do Bing News e Google News em chinês; o link e o título são extraídos de itens reais, publicados nas últimas 96 horas.
-- **Imagem:** retirada dos metadados da matéria (\`og:image\` / \`twitter:image\`) ou da mídia indicada no RSS. A foto é baixada e anexada ao Discord para não depender de hotlink. Sem foto validada, a notícia é ignorada.
+- **Imagem:** retirada dos metadados da matéria (`og:image` / `twitter:image`) ou da mídia indicada no RSS. A foto é baixada e anexada ao Discord para não depender de hotlink. Sem foto validada, a notícia é ignorada.
 - **Tradução:** título e resumo traduzidos para português brasileiro pelos provedores já existentes (Gemini 1, Gemini 2, NVIDIA e Groq, nessa ordem). Não inventar informações além do título e resumo.
 - **Tópico:** cada mensagem em chinês origina um tópico público com a tradução em português e o mesmo link de fonte.
 - **Não repetição:** URLs publicadas em SQLite e verificação do histórico recente do canal.
@@ -16,23 +16,23 @@ Serviço instalado automaticamente pelo módulo \`bridge_chain.py\` do \`discord
 
 ## Configuração (Render)
 
-A rotina inicia por padrão com \`BRIDGE_APP_MODULE=bridge_chain\`. As variáveis abaixo são opcionais, pois já têm valores padrão:
+A rotina inicia por padrão com `BRIDGE_APP_MODULE=bridge_chain`. As variáveis abaixo são opcionais, pois já têm valores padrão:
 
-\`\`\`dotenv
+```dotenv
 CHINA_NEWS_ENABLED=true
 CHINA_NEWS_CHANNEL_ID=1560415874114920559
 CHINA_NEWS_INTERVAL_SECONDS=7200
 CHINA_NEWS_MAX_AGE_HOURS=96
 CHINA_NEWS_DB_PATH=/data/china_news.sqlite3
-\`\`\`
+```
 
 A conta precisa poder visualizar e escrever no canal, **criar tópicos públicos e enviar mensagens nos tópicos**, além de anexar arquivos. O destino precisa ser um canal de texto tradicional; posts em canais de fórum exigem outra integração.
 
-O agendador roda somente enquanto o processo \`meu-discord\` estiver ativo. Hospedagens que suspendem instâncias impedem publicações nesse período. Para evitar perda de histórico entre reinícios, monte um volume persistente em \`/data\` (se disponível). Sem volume, o código verifica notícias recentes do histórico do Discord, mas não garante histórico de URLs entre reinícios.
+O agendador roda somente enquanto o processo `meu-discord` estiver ativo. Hospedagens que suspendem instâncias impedem publicações nesse período. Para evitar perda de histórico entre reinícios, monte um volume persistente em `/data` (se disponível). Sem volume, o código verifica notícias recentes do histórico do Discord, mas não garante histórico de URLs entre reinícios.
 
 ## Diagnóstico
 
-Acesse \`GET /api/china-news/status\` no servidor bridge (interno), com \`Authorization: Bearer <API_TOKEN>\`. O endpoint informa configuração, última publicação, tentativa, notícia e erro. No log do serviço, busque \`[ChinaNews]\`.
+Acesse `GET /api/china-news/status` no servidor bridge (interno), com `Authorization: Bearer <API_TOKEN>`. O endpoint informa configuração, última publicação, tentativa, notícia e erro. No log do serviço, busque `[ChinaNews]`.
 
 > **Aviso do Discord:** automatizar contas pessoais (selfbots) contraria os Termos de Serviço da plataforma e pode levar a suspensão da conta. Para uma operação de longo prazo, recomenda-se migrar o publicador para um bot oficial com token de aplicação.
 
@@ -40,13 +40,13 @@ Acesse \`GET /api/china-news/status\` no servidor bridge (interno), com \`Author
 
 Digite no **servidor configurado**:
 
-- \`!noticia\` — publica imediatamente a próxima categoria do rodízio.
-- \`!noticia nacional\` — notícia nacional chinesa.
-- \`!noticia provincia\` (ou \`!noticia província\`) — notícia de província chinesa.
-- \`!noticia fofoca\` — notícia sobre entretenimento, celebridades ou fofocas.
+- `!noticia` — publica imediatamente a próxima categoria do rodízio.
+- `!noticia nacional` — notícia nacional chinesa.
+- `!noticia provincia` (ou `!noticia província`) — notícia de província chinesa.
+- `!noticia fofoca` — notícia sobre entretenimento, celebridades ou fofocas.
 
 O comando publica no canal de notícias configurado, independentemente do canal onde for enviado, e responde com um link para a mensagem criada. Pula a espera de duas horas, mas **não repete matérias** e não ignora a exigência de imagem, fonte e tradução. Um novo envio manual só pode começar após 30 segundos, por padrão. A publicação manual também reinicia a contagem de 2 horas da rotina.
 
-Por segurança, apenas a própria conta conectada ou os IDs relacionados em \`CHINA_NEWS_ADMIN_IDS\` podem ativá-lo. Os demais comandos do Greed são preservados.
+Por segurança, apenas a própria conta conectada, o dono do servidor ou os IDs relacionados em `CHINA_NEWS_ADMIN_IDS` podem ativá-lo. Os demais comandos do Greed são preservados.
 
-Variáveis opcionais: \`CHINA_NEWS_GUILD_ID=1251266361569710222\`, \`CHINA_NEWS_ADMIN_IDS=123456789012345678\` (vários separados por vírgula), \`CHINA_NEWS_MANUAL_COOLDOWN_SECONDS=30\`.
+Variáveis opcionais: `CHINA_NEWS_GUILD_ID=1251266361569710222`, `CHINA_NEWS_ADMIN_IDS=123456789012345678` (vários separados por vírgula), `CHINA_NEWS_MANUAL_COOLDOWN_SECONDS=30`.
