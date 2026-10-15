@@ -102,38 +102,48 @@ class _ArticleImageParser(HTMLParser):
 
 
 class _ArticleTextParser(HTMLParser):
-    """Captura parágrafos jornalísticos, priorizando o corpo do artigo."""
+    """Captura parágrafos da reportagem, não menus, anúncios nem rodapés."""
+    VOID_TAGS = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr",
+    }
+    IGNORE_TAGS = {"script", "style", "noscript", "nav", "footer", "aside"}
+    CONTENT_AREA = re.compile(
+        r"left_zw|cont_1_1_2|article[-_]?content|article[-_]?body|"
+        r"news[-_]?content|post[-_]?content|detail[-_]?content", re.I
+    )
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self._depth = 0
-        self._article_depths: list[int] = []
-        self._ignore_depth = 0
+        self.stack: list[tuple[str, bool, bool]] = []
         self._inside_p = False
-        self._p_is_article = False
+        self._p_article = False
         self._p_parts: list[str] = []
         self.primary: list[str] = []
         self.other: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "br" and self._inside_p:
+            self._p_parts.append(" ")
+        if tag in self.VOID_TAGS:
+            return
         values = dict(attrs)
-        self._depth += 1
-        if tag in {"script", "style", "noscript", "nav", "footer"}:
-            self._ignore_depth += 1
         role = (values.get("class") or "") + " " + (values.get("id") or "")
-        # 中国新闻网 publica a reportagem sob .left_zw/#cont_1_1_2.
-        if tag in {"article", "main"} or re.search(
-            r"left_zw|cont_1_1_2|article[-_]?content|article[-_]?body|"
-            r"news[-_]?content|post[-_]?content|detail[-_]?content",
-            role, re.I,
-        ):
-            self._article_depths.append(self._depth)
-        if tag == "p" and not self._inside_p:
+        article = tag in {"article", "main"} or bool(self.CONTENT_AREA.search(role))
+        ignored = tag in self.IGNORE_TAGS
+        self.stack.append((tag, article, ignored))
+        if tag == "p":
             self._inside_p = True
             self._p_parts = []
-            self._p_is_article = bool(self._article_depths)
+            self._p_article = any(a for _, a, _ in self.stack)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        if tag not in self.VOID_TAGS:
+            self.handle_endtag(tag)
 
     def handle_data(self, data: str) -> None:
-        if self._inside_p and not self._ignore_depth:
+        if self._inside_p and not any(ignore for _, _, ignore in self.stack):
             self._p_parts.append(data)
 
     def handle_endtag(self, tag: str) -> None:
@@ -144,21 +154,19 @@ class _ArticleTextParser(HTMLParser):
                 r"^(责任编辑|编辑：|来源：|版权声明|分享到|点击进入|扫码|推荐阅读)",
                 paragraph,
             ):
-                target = self.primary if self._p_is_article else self.other
+                target = self.primary if self._p_article else self.other
                 if paragraph not in target:
                     target.append(paragraph)
             self._inside_p = False
             self._p_parts = []
-        if self._article_depths and self._article_depths[-1] == self._depth:
-            self._article_depths.pop()
-        if tag in {"script", "style", "noscript", "nav", "footer"}:
-            self._ignore_depth = max(0, self._ignore_depth - 1)
-        self._depth = max(0, self._depth - 1)
+        for index in range(len(self.stack) - 1, -1, -1):
+            if self.stack[index][0] == tag:
+                del self.stack[index:]
+                break
 
     def get_text(self, limit: int = 10000) -> str:
         paragraphs = self.primary if sum(map(len, self.primary)) >= 350 else self.other
         return "\n\n".join(paragraphs)[:limit]
-
 
 
 def _feed_image(item: ET.Element) -> list[str]:
