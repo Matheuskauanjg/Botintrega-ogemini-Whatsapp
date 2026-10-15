@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import re
 import sqlite3
@@ -1356,36 +1357,81 @@ drawing.install(client, app, _persistent_recent_context, base.require_api_token)
 # Notícias chinesas: RSS -> imagem original -> publicação -> tópico em PT-BR
 # Não utiliza a persona/regras de chat para traduzir matérias jornalísticas.
 # ---------------------------------------------------------------------------
-async def _translate_china_news(title: str, summary: str) -> str | None:
+def _parse_china_news_editorial(raw: str) -> tuple[str, str] | None:
+    """Exige resumo original em chinês e sua versão fiel em português."""
+    try:
+        stripped = raw.strip()
+        fence = chr(96) * 3
+        if stripped.startswith(fence):
+            stripped = re.sub(r"^" + fence + r"(?:json)?\s*", "", stripped, flags=re.I)
+            stripped = re.sub(r"\s*" + fence + r"$", "", stripped)
+        start, end = stripped.find("{"), stripped.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        data = json.loads(stripped[start:end + 1])
+        zh = str(data.get("zh") or "").strip()
+        pt = str(data.get("pt") or "").strip()
+        chinese_count = len(re.findall(r"[\u3400-\u9fff]", zh))
+        if chinese_count < 230 or len(pt) < 370:
+            return None
+        if re.search(r"[\u3400-\u9fff]", pt[:90]):
+            return None
+        # O formato do Discord é controlado pelo editor, não pelo modelo.
+        return zh[:1900], pt[:6500]
+    except (json.JSONDecodeError, TypeError, AttributeError, ValueError):
+        return None
+
+
+async def _translate_china_news(
+    title: str, summary: str, body_text: str
+) -> tuple[str, str] | None:
+    """Reescreve reportagem real em chinês e produz tradução equivalente."""
     system = (
-        "Você é um tradutor jornalístico profissional de chinês para português do Brasil. "
-        "Traduza APENAS as informações do título e do pequeno resumo fornecidos. "
-        "Não invente detalhes, nomes, datas, fatos ou declarações. "
-        "Preserve nomes próprios e eventuais incertezas. "
-        "Retorne apenas dois parágrafos em português, iniciados por "
-        "'**Título:**' e '**Resumo:**'. Não acrescente comentários."
+        "Você é editor e tradutor jornalístico especializado em reportagens chinesas. "
+        "Use EXCLUSIVAMENTE o texto da reportagem abaixo como base. "
+        "Não acrescente fatos, datas, números, nomes ou declarações ausentes da fonte. "
+        "Não copie a reportagem original: produza um resumo autoral fiel e factual. "
+        "Retorne APENAS JSON válido com dois campos: "
+        '{"zh":"...","pt":"..."}. '
+        "Campo zh: matéria informativa em chinês simplificado, 4 a 6 parágrafos, "
+        "com aproximadamente 550 a 850 caracteres chineses ao todo. "
+        "Campo pt: tradução integral e fiel desses mesmos parágrafos para português "
+        "do Brasil, usando linguagem jornalística natural. "
+        "Os parágrafos dos dois campos devem corresponder; se o texto fonte for curto "
+        "não invente nem complete com suposições. "
+        "Use quebras de parágrafo \\n\\n codificadas dentro dos valores JSON. "
+        "Não repita o título no corpo, não inclua markdown, fontes extras ou comentários."
     )
-    prompt = f"Título (chinês): {title}\nResumo (chinês): {summary or '(sem resumo disponível)'}"
+    prompt = (
+        f"Título original: {title}\n"
+        f"Resumo original: {summary}\n"
+        "Conteúdo verificável da reportagem original:\n"
+        f"{body_text[:9000]}"
+    )
     for provider, api_key, models in (
         ("gemini1", GEMINI_API_KEY_1, GEMINI_MODELS_1),
         ("gemini2", GEMINI_API_KEY_2, GEMINI_MODELS_2),
     ):
-        result = await _try_gemini_provider(provider, api_key, models, prompt, system, 850)
-        if result and result[0].strip():
-            return result[0].strip()[:3000]
-    result = await _try_nvidia_provider(prompt, system, 850)
-    if result and result.strip():
-        return result.strip()[:3000]
+        result = await _try_gemini_provider(provider, api_key, models, prompt, system, 3600)
+        if result:
+            parsed = _parse_china_news_editorial(result[0])
+            if parsed:
+                return parsed
+    result = await _try_nvidia_provider(prompt, system, 3600)
+    if result:
+        parsed = _parse_china_news_editorial(result)
+        if parsed:
+            return parsed
     if base.GROQ_API_KEY:
         try:
-            async with httpx.AsyncClient(timeout=25) as http:
+            async with httpx.AsyncClient(timeout=35) as http:
                 response = await http.post(
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {base.GROQ_API_KEY}"},
                     json={
                         "model": auto.GROQ_AUTO_REPLY_MODEL,
-                        "temperature": 0.1,
-                        "max_tokens": 850,
+                        "temperature": 0.15,
+                        "max_tokens": 3600,
                         "messages": [
                             {"role": "system", "content": system},
                             {"role": "user", "content": prompt},
@@ -1394,10 +1440,9 @@ async def _translate_china_news(title: str, summary: str) -> str | None:
                 )
                 response.raise_for_status()
                 answer = response.json()["choices"][0]["message"]["content"].strip()
-                if answer:
-                    return answer[:3000]
+                return _parse_china_news_editorial(answer)
         except (httpx.HTTPError, KeyError, IndexError, TypeError) as exc:
-            print(f"[ChinaNews] Tradução Groq falhou: {type(exc).__name__}", flush=True)
+            print(f"[ChinaNews] Editor Groq indisponível: {type(exc).__name__}", flush=True)
     return None
 
 
