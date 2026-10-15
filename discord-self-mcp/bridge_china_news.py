@@ -101,6 +101,66 @@ class _ArticleImageParser(HTMLParser):
                     break
 
 
+class _ArticleTextParser(HTMLParser):
+    """Captura parágrafos jornalísticos, priorizando o corpo do artigo."""
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._depth = 0
+        self._article_depths: list[int] = []
+        self._ignore_depth = 0
+        self._inside_p = False
+        self._p_is_article = False
+        self._p_parts: list[str] = []
+        self.primary: list[str] = []
+        self.other: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        self._depth += 1
+        if tag in {"script", "style", "noscript", "nav", "footer"}:
+            self._ignore_depth += 1
+        role = (values.get("class") or "") + " " + (values.get("id") or "")
+        # 中国新闻网 publica a reportagem sob .left_zw/#cont_1_1_2.
+        if tag in {"article", "main"} or re.search(
+            r"left_zw|cont_1_1_2|article[-_]?content|article[-_]?body|"
+            r"news[-_]?content|post[-_]?content|detail[-_]?content",
+            role, re.I,
+        ):
+            self._article_depths.append(self._depth)
+        if tag == "p" and not self._inside_p:
+            self._inside_p = True
+            self._p_parts = []
+            self._p_is_article = bool(self._article_depths)
+
+    def handle_data(self, data: str) -> None:
+        if self._inside_p and not self._ignore_depth:
+            self._p_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "p" and self._inside_p:
+            paragraph = _clean("".join(self._p_parts), 1800)
+            cjk_count = len(re.findall(r"[\u3400-\u9fff]", paragraph))
+            if cjk_count >= 18 and not re.search(
+                r"^(责任编辑|编辑：|来源：|版权声明|分享到|点击进入|扫码|推荐阅读)",
+                paragraph,
+            ):
+                target = self.primary if self._p_is_article else self.other
+                if paragraph not in target:
+                    target.append(paragraph)
+            self._inside_p = False
+            self._p_parts = []
+        if self._article_depths and self._article_depths[-1] == self._depth:
+            self._article_depths.pop()
+        if tag in {"script", "style", "noscript", "nav", "footer"}:
+            self._ignore_depth = max(0, self._ignore_depth - 1)
+        self._depth = max(0, self._depth - 1)
+
+    def get_text(self, limit: int = 10000) -> str:
+        paragraphs = self.primary if sum(map(len, self.primary)) >= 350 else self.other
+        return "\n\n".join(paragraphs)[:limit]
+
+
+
 def _feed_image(item: ET.Element) -> list[str]:
     candidates: list[str] = []
     for elem in item.iter():
@@ -311,15 +371,20 @@ async def _download_image(
 
 async def _article_image(http: httpx.AsyncClient, article: dict) -> tuple[bytes, str] | None:
     urls: list[str] = []
-    # Foto de capa extraída do artigo é preferível a miniaturas genéricas.
+    # Obtém conteúdo e fotos da mesma página, sem repetir o download do HTML.
+    article["body_text"] = ""
     try:
         response = await http.get(article["url"], follow_redirects=True)
         response.raise_for_status()
         if "text/html" in response.headers.get("content-type", ""):
-            parser = _ArticleImageParser()
-            parser.feed(response.text[:500000])
-            urls.extend(urljoin(str(response.url), image) for image in parser.images)
-            urls.extend(urljoin(str(response.url), image) for image in parser.body_images[:15])
+            raw_html = response.text[:900000]
+            images = _ArticleImageParser()
+            images.feed(raw_html)
+            urls.extend(urljoin(str(response.url), image) for image in images.images)
+            urls.extend(urljoin(str(response.url), image) for image in images.body_images[:15])
+            text_parser = _ArticleTextParser()
+            text_parser.feed(raw_html)
+            article["body_text"] = text_parser.get_text()
     except (httpx.HTTPError, ValueError):
         pass
     urls.extend(urljoin(article["url"], image) for image in article["images"])
@@ -341,31 +406,81 @@ async def _last_discord_post(channel, own_id: int) -> float:
     return 0.0
 
 
-async def _publish(channel, article: dict, image: tuple[bytes, str], translation: str) -> int:
-    category = article["category"]
-    source = article["source"] or "Noticiário"
-    content = (
-        f"{MARKER} · {category}\n\n"
-        f"**{article['title']}**\n"
-        f"{article['description'][:540]}\n\n"
-        f"🗞️ 来源：{source}\n"
-        f"🔗 原文：<{article['url']}>\n"
-        "🇧🇷 葡语翻译请查看下方讨论串。"
-    )[:1900]
+def _format_news_post(article: dict, chinese_text: str) -> str:
+    """Preserva toda a fonte e o CTA; nunca corta a URL do veículo."""
+    footer = (
+        f"\n\n🗞️ 来源：{article['source'] or '新闻媒体'}"
+        f"\n🔗 原文：<{article['url']}>"
+        "\n🇧🇷 葡语翻译请查看下方讨论串。"
+    )
+    header = f"{MARKER} · {article['category']}\n\n**{article['title']}**\n\n"
+    room = 1950 - len(header) - len(footer)
+    if room < 180:
+        raise ValueError("Título ou URL da notícia muito compridos")
+    paragraphs = [line.strip() for line in chinese_text.split("\n") if line.strip()]
+    kept: list[str] = []
+    remaining = room
+    for paragraph in paragraphs:
+        required = len(paragraph) + (2 if kept else 0)
+        if required > remaining:
+            break
+        kept.append(paragraph)
+        remaining -= required
+    text = "\n\n".join(kept)
+    if len(text) < 250:
+        raise ValueError("Resumo jornalístico chinês insuficiente para publicação longa")
+    return header + text + footer
+
+
+def _split_translation(text: str, max_chars: int = 1850) -> list[str]:
+    """Divide em parágrafos sem romper palavras/links no meio."""
+    pieces, current = [], ""
+    for paragraph in text.split("\n\n"):
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+        candidate = (current + "\n\n" + paragraph) if current else paragraph
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+        if current:
+            pieces.append(current)
+            current = ""
+        if len(paragraph) <= max_chars:
+            current = paragraph
+        else:
+            # Caso excepcional de parágrafo longo, divide em limites de palavra.
+            for word in paragraph.split():
+                candidate = (current + " " + word) if current else word
+                if len(candidate) <= max_chars:
+                    current = candidate
+                else:
+                    if current:
+                        pieces.append(current)
+                    current = word[:max_chars]
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+async def _publish(
+    channel, article: dict, image: tuple[bytes, str], chinese_text: str, translation: str
+) -> int:
+    content = _format_news_post(article, chinese_text)
     file = discord.File(io.BytesIO(image[0]), filename=f"china-news.{image[1]}")
     posted = await channel.send(content=content, file=file)
     try:
         thread = await posted.create_thread(name=f"🇧🇷 Tradução | {article['title'][:63]}")
         translated = (
-            f"🇧🇷 **Tradução da notícia — {category}**\n\n"
+            f"🇧🇷 **Tradução da notícia — {article['category']}**\n\n"
             f"{translation.strip()}\n\n"
-            f"🗞️ **Fonte:** {source}\n🔗 **Notícia original:** <{article['url']}>\n"
-            "ℹ️ Tradução do título e resumo publicados na fonte, não do texto integral."
+            f"🗞️ **Fonte:** {article['source'] or 'Noticiário'}\n"
+            f"🔗 **Notícia original:** <{article['url']}>\n"
+            "ℹ️ Resumo jornalístico reescrito a partir da reportagem original."
         )
-        for start in range(0, len(translated), 1850):
-            await thread.send(translated[start:start + 1850])
+        for chunk in _split_translation(translated):
+            await thread.send(chunk)
     except Exception:
-        # Não manter publicação sem o tópico de tradução.
         try:
             await posted.delete()
         except Exception:
@@ -444,11 +559,24 @@ class ChinaNewsService:
                     image = await _article_image(http, article)
                     if not image:
                         continue
-                    translation = await self.translator(article["title"], article["description"])
-                    if not translation:
-                        self.status["lastError"] = "Provedores de tradução indisponíveis"
+                    # Para escrever um texto longo, a página precisa conter fatos suficientes.
+                    body_text = article.get("body_text") or ""
+                    if len(re.findall(r"[\u3400-\u9fff]", body_text)) < 220:
+                        print(f"[ChinaNews] Conteúdo curto demais: {article['url']}", flush=True)
+                        continue
+                    editorial = await self.translator(
+                        article["title"], article["description"], body_text
+                    )
+                    if not editorial:
+                        self.status["lastError"] = "Provedores de redação/tradução indisponíveis"
                         return {"ok": False, "reason": self.status["lastError"]}
-                    message_id = await _publish(channel, article, image, translation)
+                    chinese_text, translation = editorial
+                    try:
+                        _format_news_post(article, chinese_text)
+                    except ValueError:
+                        print(f"[ChinaNews] Texto gerado muito curto: {article['url']}", flush=True)
+                        continue
+                    message_id = await _publish(channel, article, image, chinese_text, translation)
                     await asyncio.to_thread(_save_post, article, message_id)
                     self.status["lastPosted"] = datetime.now(timezone.utc).isoformat()
                     self.status["lastError"] = None
