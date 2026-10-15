@@ -1,0 +1,26 @@
+name: China News checks
+
+on:
+  push:
+    branches: [discord-self]
+    paths:
+      - "discord-self-mcp/bridge_china_news.py"
+      - "discord-self-mcp/test_bridge_china_news.py"
+      - ".github/workflows/china-news-check.yml"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install lightweight runtime dependencies
+        run: python -m pip install "discord.py-self>=2.1,<3" "fastapi>=0.116,<1" "httpx>=0.28,<1"
+      - name: Verify Python syntax
+        run: python -m compileall -q discord-self-mcp
+      - name: Run offline China News tests
+        working-directory: discord-self-mcp
+        run: python -m unittest -v test_bridge_china_news
