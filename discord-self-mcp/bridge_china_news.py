@@ -347,7 +347,15 @@ class ChinaNewsService:
 
 def install(client, app, translator, auth_dependency) -> ChinaNewsService:
     service = ChinaNewsService(client, translator)
-    client.add_listener(service.on_ready, "on_ready")
+    # discord.Client (classe base usada pelo bridge) não possui add_listener().
+    # Encadeia o on_ready existente sem substituir a inicialização atual.
+    previous_on_ready = getattr(client, "on_ready", None)
+
+    @client.event
+    async def on_ready() -> None:
+        if previous_on_ready is not None:
+            await previous_on_ready()
+        await service.on_ready()
 
     @app.get("/api/china-news/status", dependencies=[Depends(auth_dependency)])
     async def china_news_status() -> dict:
