@@ -19,6 +19,16 @@ import httpx
 from fastapi import Depends
 
 CHANNEL_ID = int(os.getenv("CHINA_NEWS_CHANNEL_ID", "1560415874114920559"))
+GUILD_ID = int(os.getenv("CHINA_NEWS_GUILD_ID", "1251266361569710222"))
+MANUAL_COOLDOWN = max(10, int(os.getenv("CHINA_NEWS_MANUAL_COOLDOWN_SECONDS", "30")))
+ADMIN_IDS = {item.strip() for item in os.getenv("CHINA_NEWS_ADMIN_IDS", "").split(",") if item.strip()}
+COMMAND_RE = re.compile(r"^!noticia(?:\\s+(nacional|prov[ií]ncia|fofoca))?\\s*$", re.IGNORECASE)
+CATEGORY_ALIASES = {
+    "nacional": "国内",
+    "provincia": "地方",
+    "província": "地方",
+    "fofoca": "娱乐",
+}
 ENABLED = os.getenv("CHINA_NEWS_ENABLED", "true").lower() in {"true", "1", "yes", "on"}
 INTERVAL = max(3600, int(os.getenv("CHINA_NEWS_INTERVAL_SECONDS", "7200")))
 MAX_AGE_HOURS = max(12, int(os.getenv("CHINA_NEWS_MAX_AGE_HOURS", "96")))
@@ -176,8 +186,8 @@ async def _rss_results(http: httpx.AsyncClient, query: str, category: str) -> li
     return []
 
 
-def _queries(post_count: int) -> list[tuple[str, str]]:
-    category = CATEGORIES[post_count % len(CATEGORIES)]
+def _queries(post_count: int, category_override: str | None = None) -> list[tuple[str, str]]:
+    category = category_override or CATEGORIES[post_count % len(CATEGORIES)]
     province = PROVINCES[(post_count // len(CATEGORIES)) % len(PROVINCES)]
     if category == "国内":
         return [("中国 国内 最新新闻 时政 社会", category), ("中国 今日 国内 要闻", category)]
@@ -284,9 +294,13 @@ class ChinaNewsService:
         self.client = client
         self.translator = translator
         self.task: asyncio.Task | None = None
+        self._publish_lock = asyncio.Lock()
+        self._last_manual_attempt = 0.0
         self.status: dict = {
             "enabled": ENABLED,
             "channelId": str(CHANNEL_ID),
+            "guildId": str(GUILD_ID),
+            "manualCommand": "!noticia [nacional|provincia|fofoca]",
             "intervalSeconds": INTERVAL,
             "lastPosted": None,
             "lastError": None,
@@ -300,7 +314,8 @@ class ChinaNewsService:
         while True:
             try:
                 await self.client.wait_until_ready()
-                await self._tick()
+                async with self._publish_lock:
+                    await self._tick()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -308,22 +323,35 @@ class ChinaNewsService:
                 print(f"[ChinaNews] {self.status['lastError']}", flush=True)
             await asyncio.sleep(60)
 
-    async def _tick(self) -> None:
+    async def publish_now(self, category: str | None = None) -> dict:
+        """Publicação manual: dispensa as 2h, mas mantém deduplicação e proteção antispam."""
+        if self._publish_lock.locked():
+            return {"ok": False, "reason": "Já estou procurando uma notícia. Tente novamente."}
+        async with self._publish_lock:
+            now = time.monotonic()
+            remaining = MANUAL_COOLDOWN - (now - self._last_manual_attempt)
+            if remaining > 0:
+                return {"ok": False, "reason": f"Aguarde {int(remaining) + 1}s para usar o comando novamente."}
+            self._last_manual_attempt = now
+            return await self._tick(force=True, category_override=category)
+
+    async def _tick(self, force: bool = False, category_override: str | None = None) -> dict:
         last_sent, count, seen = await asyncio.to_thread(_read_state)
-        if time.time() - last_sent < INTERVAL:
-            return
+        if not force and time.time() - last_sent < INTERVAL:
+            return {"ok": False, "reason": "intervalo"}
         channel = self.client.get_channel(CHANNEL_ID) or await self.client.fetch_channel(CHANNEL_ID)
         if getattr(channel, "guild", None) is None or not hasattr(channel, "send"):
             raise RuntimeError("Canal indisponível ou não é um canal de texto de servidor")
         last_discord = await _last_discord_post(channel, self.client.user.id)
-        if time.time() - max(last_sent, last_discord) < INTERVAL:
-            return
+        if not force and time.time() - max(last_sent, last_discord) < INTERVAL:
+            return {"ok": False, "reason": "intervalo"}
         self.status["lastAttempt"] = datetime.now(timezone.utc).isoformat()
+        self.status["lastMode"] = "manual" if force else "scheduled"
         async with httpx.AsyncClient(
             timeout=16, follow_redirects=True,
             headers={"user-agent": USER_AGENT, "accept-language": "zh-CN,zh;q=0.9"},
         ) as http:
-            for query, category in _queries(count):
+            for query, category in _queries(count, category_override):
                 results = await _rss_results(http, query, category)
                 for article in results[:12]:
                     if article["url"] in seen:
@@ -334,15 +362,16 @@ class ChinaNewsService:
                     translation = await self.translator(article["title"], article["description"])
                     if not translation:
                         self.status["lastError"] = "Provedores de tradução indisponíveis"
-                        return
+                        return {"ok": False, "reason": self.status["lastError"]}
                     message_id = await _publish(channel, article, image, translation)
                     await asyncio.to_thread(_save_post, article, message_id)
                     self.status["lastPosted"] = datetime.now(timezone.utc).isoformat()
                     self.status["lastError"] = None
                     self.status["lastArticle"] = article["url"]
                     print(f"[ChinaNews] Publicado ({category}) {article['url']}", flush=True)
-                    return
+                    return {"ok": True, "messageId": str(message_id), "category": category, "url": article["url"]}
         self.status["lastError"] = "Nenhuma notícia recente com imagem real disponível"
+        return {"ok": False, "reason": self.status["lastError"]}
 
 
 def install(client, app, translator, auth_dependency) -> ChinaNewsService:
@@ -356,6 +385,40 @@ def install(client, app, translator, auth_dependency) -> ChinaNewsService:
         if previous_on_ready is not None:
             await previous_on_ready()
         await service.on_ready()
+
+    # Empilha o comando no fim da cadeia de on_message, sem afetar os outros comandos.
+    previous_on_message = getattr(client, "on_message", None)
+
+    @client.event
+    async def on_message(message) -> None:
+        content = str(getattr(message, "content", "") or "").strip()
+        match = COMMAND_RE.fullmatch(content)
+        if match and getattr(getattr(message, "guild", None), "id", None) == GUILD_ID:
+            author_id = str(getattr(getattr(message, "author", None), "id", ""))
+            own_id = str(getattr(getattr(client, "user", None), "id", ""))
+            if author_id and (author_id == own_id or author_id in ADMIN_IDS):
+                category = CATEGORY_ALIASES.get((match.group(1) or "").lower())
+                try:
+                    result = await service.publish_now(category)
+                    if result.get("ok"):
+                        link = (
+                            f"https://discord.com/channels/{GUILD_ID}/{CHANNEL_ID}/"
+                            f"{result['messageId']}"
+                        )
+                        reply = f"📰 Notícia publicada com imagem e tópico de tradução! {link}"
+                    else:
+                        reply = f"⚠️ Notícia não publicada: {result.get('reason', 'erro desconhecido')}"
+                except Exception as exc:
+                    service.status["lastError"] = f"{type(exc).__name__}: {exc}"[:250]
+                    print(f"[ChinaNews] Falha no comando: {service.status['lastError']}", flush=True)
+                    reply = "⚠️ Falha ao publicar a notícia. Verifique os logs do serviço."
+                try:
+                    await message.channel.send(reply)
+                except Exception as exc:
+                    print(f"[ChinaNews] Falha ao responder comando: {type(exc).__name__}", flush=True)
+                return
+        if previous_on_message is not None:
+            await previous_on_message(message)
 
     @app.get("/api/china-news/status", dependencies=[Depends(auth_dependency)])
     async def china_news_status() -> dict:
