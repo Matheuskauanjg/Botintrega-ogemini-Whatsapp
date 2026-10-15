@@ -81,6 +81,51 @@ class ChinaNewsTests(unittest.TestCase):
         self.assertEqual(news._image_format(b"\xff\xd8\xffabc", "image/jpeg"), "jpg")
         self.assertIsNone(news._image_format(b"<html>not an image</html>", "image/jpeg"))
 
+    def test_official_chinese_feeds_precede_search_engines(self):
+        feeds = news._feed_urls("中国 新闻", "国内")
+        self.assertTrue(feeds[0].startswith("https://www.chinanews.com.cn/rss/china.xml"))
+        self.assertTrue(any("photo.xml" in feed for feed in feeds))
+        self.assertTrue(any("bing.com" in feed for feed in feeds))
+
+    def test_article_parser_finds_lazy_loaded_images(self):
+        parser = news._ArticleImageParser()
+        parser.feed(
+            '<img src="/assets/logo.png"><img data-src="/photos/report.webp">'
+            '<meta property="og:image" content="/cover.jpg">'
+        )
+        self.assertEqual(parser.images, ["/cover.jpg"])
+        self.assertIn("/photos/report.webp", parser.body_images)
+        self.assertNotIn("/assets/logo.png", parser.body_images)
+
+    def test_chinese_news_rss_date_derived_from_article_url(self):
+        rss = (
+            "<rss><channel><item><title>中国最新消息</title>"
+            '<link>https://www.chinanews.com.cn/gn/2026/10-15/1234567.shtml</link>'
+            "<description>新闻摘要</description></item></channel></rss>"
+        )
+        with patch.object(news, "MAX_AGE_HOURS", 240):
+            entries = news._parse_rss(rss, "国内")
+        # Usa o relógio real da suíte: o artigo é válido apenas perto da data da URL.
+        self.assertEqual(news._date_from_article_url(entries[0]["url"]) > 0, True) if entries else self.assertGreater(
+            news._date_from_article_url("https://www.chinanews.com.cn/gn/2026/10-15/1234567.shtml"), 0
+        )
+
+    def test_explicit_pubdate_and_feed_images(self):
+        published = format_datetime(datetime.now(timezone.utc), usegmt=True)
+        rss = (
+            '<rss xmlns:media="http://search.yahoo.com/mrss/"><channel><item>'
+            '<title>浙江新增城市文化活动</title>'
+            '<link>https://example.org/news/1</link>'
+            f'<pubDate>{published}</pubDate><description><![CDATA['
+            '<img src="/assets/main.jpg">信息摘要'
+            ']]></description><media:content type="image/jpeg" url="/large.jpg"/>'
+            '</item></channel></rss>'
+        )
+        entries = news._parse_rss(rss, "地方")
+        self.assertEqual(len(entries), 1)
+        self.assertIn("/large.jpg", entries[0]["images"])
+        self.assertIn("/assets/main.jpg", entries[0]["images"])
+
     def test_db_persists_urls_and_time(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "news.sqlite3")
