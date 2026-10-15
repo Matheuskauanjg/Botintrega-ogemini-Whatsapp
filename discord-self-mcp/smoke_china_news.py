@@ -1,6 +1,7 @@
 """Leitura de RSS e imagens reais (sem postar no Discord). Teste de conectividade opcional."""
 import asyncio
 import os
+import re
 
 import httpx
 
@@ -18,7 +19,7 @@ async def main():
         follow_redirects=True,
         headers={"user-agent": USER_AGENT, "accept-language": "zh-CN,zh;q=0.9"},
     ) as client:
-        total_articles, image_found = 0, False
+        total_articles, image_found, body_found = 0, False, False
         for category, url in samples:
             try:
                 response = await client.get(url)
@@ -33,16 +34,22 @@ async def main():
                         print(f"IMAGE candidate error={type(exc).__name__}")
                         continue
                     print(f"IMAGE {'ok' if found else 'unavailable'} source={article['source']}")
+                    cjk_length = len(re.findall(r"[\u3400-\u9fff]", article.get("body_text", "")))
+                    print(f"ARTICLE extracted_cjk_chars={cjk_length} url={article['url']}")
+                    if cjk_length >= 220:
+                        body_found = True
                     if found:
                         image_found = True
                         break
             except httpx.HTTPError as exc:
                 print(f"FEED {url} error={type(exc).__name__}")
-        print(f"RESULT articles={total_articles} photo_valid={image_found}")
+        print(f"RESULT articles={total_articles} photo_valid={image_found} article_text_valid={body_found}")
         if not total_articles:
             raise RuntimeError("No recent articles returned from official feeds")
         if not image_found:
             raise RuntimeError("Recent articles returned, but none of the sampled photos downloaded")
+        if not body_found:
+            raise RuntimeError("No full-length Chinese article body extracted from sample")
 
 
 if __name__ == "__main__":
