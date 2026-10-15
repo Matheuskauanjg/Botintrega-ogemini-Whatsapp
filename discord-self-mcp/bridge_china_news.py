@@ -22,7 +22,7 @@ CHANNEL_ID = int(os.getenv("CHINA_NEWS_CHANNEL_ID", "1560415874114920559"))
 GUILD_ID = int(os.getenv("CHINA_NEWS_GUILD_ID", "1251266361569710222"))
 MANUAL_COOLDOWN = max(10, int(os.getenv("CHINA_NEWS_MANUAL_COOLDOWN_SECONDS", "30")))
 ADMIN_IDS = {item.strip() for item in os.getenv("CHINA_NEWS_ADMIN_IDS", "").split(",") if item.strip()}
-COMMAND_RE = re.compile(r"^!noticia(?:\\s+(nacional|prov[ií]ncia|fofoca))?\\s*$", re.IGNORECASE)
+COMMAND_RE = re.compile(r"^!noticia(?:\s+(nacional|prov[ií]ncia|fofoca))?\s*$", re.IGNORECASE)
 CATEGORY_ALIASES = {
     "nacional": "国内",
     "provincia": "地方",
