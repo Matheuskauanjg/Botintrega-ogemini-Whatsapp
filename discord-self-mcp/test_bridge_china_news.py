@@ -161,6 +161,19 @@ class ManualCommandTests(unittest.IsolatedAsyncioTestCase):
         service.publish_now.assert_not_awaited()
         self.assertEqual(client.previous_messages, [message])
 
+    async def test_server_owner_may_trigger(self):
+        client, service = self.make_client()
+        service.publish_now = AsyncMock(return_value={"ok": True, "messageId": "456"})
+        channel = SimpleNamespace(send=AsyncMock())
+        message = SimpleNamespace(
+            guild=SimpleNamespace(id=news.GUILD_ID, owner_id=111222),
+            author=SimpleNamespace(id=111222),
+            content="!noticia nacional",
+            channel=channel,
+        )
+        await client.on_message(message)
+        service.publish_now.assert_awaited_once_with("国内")
+
     async def test_manual_bypasses_interval_with_cooldown(self):
         service = news.ChinaNewsService(SimpleNamespace(), AsyncMock())
         service._tick = AsyncMock(return_value={"ok": True, "messageId": "42"})
