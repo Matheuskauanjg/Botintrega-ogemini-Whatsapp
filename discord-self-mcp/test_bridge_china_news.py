@@ -1,4 +1,5 @@
 """Testes offline do coletor (sem login Discord nem chamadas à internet)."""
+import asyncio
 import importlib
 import importlib.machinery
 import sys
@@ -8,7 +9,8 @@ import unittest
 from datetime import datetime, timezone
 from email.utils import format_datetime
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 # A suíte geral do repositório não instala dependências de runtime. Para os
 # testes offline, simula apenas os símbolos externos necessários ao import.
@@ -88,6 +90,94 @@ class ChinaNewsTests(unittest.TestCase):
                 self.assertEqual(count, 1)
                 self.assertGreater(latest, 0)
                 self.assertIn("https://example.com/china", seen)
+
+
+class ManualCommandTests(unittest.IsolatedAsyncioTestCase):
+    def make_client(self):
+        class TestClient:
+            def __init__(self):
+                self.user = SimpleNamespace(id=7654)
+                self.previous_messages = []
+                self.on_message = self.original_on_message
+                self.on_ready = self.original_on_ready
+
+            def event(self, callback):
+                setattr(self, callback.__name__, callback)
+                return callback
+
+            async def original_on_message(self, message):
+                self.previous_messages.append(message)
+
+            async def original_on_ready(self):
+                return None
+
+        class TestApp:
+            def get(self, *args, **kwargs):
+                return lambda callback: callback
+
+        client = TestClient()
+        service = news.install(client, TestApp(), AsyncMock(), lambda: None)
+        return client, service
+
+    async def test_manual_command_publishes_and_preserves_original_handlers(self):
+        client, service = self.make_client()
+        service.publish_now = AsyncMock(return_value={
+            "ok": True, "messageId": "789", "category": "娱乐",
+        })
+        channel = SimpleNamespace(send=AsyncMock())
+        message = SimpleNamespace(
+            guild=SimpleNamespace(id=news.GUILD_ID),
+            author=SimpleNamespace(id=7654),
+            content="!noticia fofoca",
+            channel=channel,
+        )
+        await client.on_message(message)
+        service.publish_now.assert_awaited_once_with("娱乐")
+        self.assertIn(
+            f"https://discord.com/channels/{news.GUILD_ID}/{news.CHANNEL_ID}/789",
+            channel.send.await_args.args[0],
+        )
+        self.assertFalse(client.previous_messages)
+        other = SimpleNamespace(
+            guild=SimpleNamespace(id=news.GUILD_ID),
+            author=SimpleNamespace(id=7654),
+            content="bom dia",
+            channel=channel,
+        )
+        await client.on_message(other)
+        self.assertEqual(client.previous_messages, [other])
+
+    async def test_manual_command_only_allows_owner_or_configured_admins(self):
+        client, service = self.make_client()
+        service.publish_now = AsyncMock()
+        message = SimpleNamespace(
+            guild=SimpleNamespace(id=news.GUILD_ID),
+            author=SimpleNamespace(id=99999),
+            content="!noticia",
+            channel=SimpleNamespace(send=AsyncMock()),
+        )
+        with patch.object(news, "ADMIN_IDS", set()):
+            await client.on_message(message)
+        service.publish_now.assert_not_awaited()
+        self.assertEqual(client.previous_messages, [message])
+
+    async def test_manual_bypasses_interval_with_cooldown(self):
+        service = news.ChinaNewsService(SimpleNamespace(), AsyncMock())
+        service._tick = AsyncMock(return_value={"ok": True, "messageId": "42"})
+        result = await service.publish_now("地方")
+        self.assertTrue(result["ok"])
+        service._tick.assert_awaited_once_with(force=True, category_override="地方")
+        duplicate = await service.publish_now("地方")
+        self.assertFalse(duplicate["ok"])
+        self.assertIn("Aguarde", duplicate["reason"])
+        self.assertEqual(service._tick.await_count, 1)
+
+    def test_command_patterns(self):
+        self.assertTrue(news.COMMAND_RE.fullmatch("!noticia"))
+        self.assertTrue(news.COMMAND_RE.fullmatch("!noticia nacional"))
+        self.assertEqual(news.COMMAND_RE.fullmatch("!noticia província").group(1), "província")
+        self.assertIsNone(news.COMMAND_RE.fullmatch("!noticia bobagem"))
+        self.assertEqual(news._queries(0, "娱乐")[0][1], "娱乐")
 
 
 if __name__ == "__main__":
