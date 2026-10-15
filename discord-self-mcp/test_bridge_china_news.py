@@ -1,5 +1,6 @@
 """Testes offline do coletor (sem login Discord nem chamadas à internet)."""
 import importlib
+import importlib.machinery
 import sys
 import tempfile
 import types
@@ -16,6 +17,7 @@ for module_name in ("discord", "httpx", "fastapi"):
         importlib.import_module(module_name)
     except ModuleNotFoundError:
         stub = types.ModuleType(module_name)
+        stub.__spec__ = importlib.machinery.ModuleSpec(module_name, loader=None)
         if module_name == "httpx":
             stub.AsyncClient = type("AsyncClient", (), {})
             stub.HTTPError = Exception
