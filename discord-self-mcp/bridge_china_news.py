@@ -396,7 +396,10 @@ def install(client, app, translator, auth_dependency) -> ChinaNewsService:
         if match and getattr(getattr(message, "guild", None), "id", None) == GUILD_ID:
             author_id = str(getattr(getattr(message, "author", None), "id", ""))
             own_id = str(getattr(getattr(client, "user", None), "id", ""))
-            if author_id and (author_id == own_id or author_id in ADMIN_IDS):
+            server_owner_id = str(getattr(message.guild, "owner_id", ""))
+            if author_id and (
+                author_id == own_id or author_id == server_owner_id or author_id in ADMIN_IDS
+            ):
                 category = CATEGORY_ALIASES.get((match.group(1) or "").lower())
                 try:
                     result = await service.publish_now(category)
