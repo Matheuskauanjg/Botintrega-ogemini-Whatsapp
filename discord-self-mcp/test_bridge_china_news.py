@@ -126,6 +126,49 @@ class ChinaNewsTests(unittest.TestCase):
         self.assertIn("/large.jpg", entries[0]["images"])
         self.assertIn("/assets/main.jpg", entries[0]["images"])
 
+    def test_long_article_extractor_ignores_navigation_and_handles_void_tags(self):
+        paragraph = "据报道，相关部门公布了一项城市服务政策，相关企业和居民对实施细节展开讨论。"
+        html = (
+            "<nav><p>" + paragraph * 3 + "</p></nav>"
+            '<meta name="viewport" content="width=device-width">'
+            '<div class="left_zw" id="cont_1_1_2"><img src="photo.jpg">'
+            '<p>' + paragraph * 7 + "</p>"
+            '<p>' + paragraph * 4 + "</p></div>"
+            '<footer><p>' + paragraph * 3 + "</p></footer>"
+        )
+        parser = news._ArticleTextParser()
+        parser.feed(html)
+        result = parser.get_text()
+        self.assertGreater(len(result), 330)
+        self.assertEqual(len(parser.primary), 2)
+        self.assertEqual(result.count(paragraph), 11)
+        self.assertNotIn("nav", result)
+
+    def test_long_news_format_preserves_link_and_full_paragraphs(self):
+        article = {
+            "title": "中国服务行业持续变化",
+            "category": "国内",
+            "url": "https://www.chinanews.com.cn/sh/2026/10-16/10715381.shtml",
+            "source": "中国新闻网",
+        }
+        body = "\n\n".join([
+            "随着城市服务领域的发展，各类新就业形式正得到更多关注。" * 4
+            for _ in range(5)
+        ])
+        post = news._format_news_post(article, body)
+        self.assertGreater(len(post), 650)
+        self.assertLess(len(post), 2000)
+        self.assertIn("https://www.chinanews.com.cn/sh/2026/10-16/10715381.shtml", post)
+        self.assertIn("葡语翻译请查看下方讨论串", post)
+        self.assertIn("\n\n", post)
+
+    def test_translation_split_preserves_paragraphs(self):
+        text = "\n\n".join(["Um parágrafo sobre a reportagem com texto claro. " * 15] * 5)
+        parts = news._split_translation(text, 650)
+        self.assertGreater(len(parts), 1)
+        self.assertTrue(all(len(part) <= 650 for part in parts))
+        self.assertEqual(" ".join(" ".join(parts).split()), " ".join(text.split()))
+
     def test_db_persists_urls_and_time(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "news.sqlite3")
