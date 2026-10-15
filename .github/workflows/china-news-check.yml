@@ -6,6 +6,7 @@ on:
     paths:
       - "discord-self-mcp/bridge_china_news.py"
       - "discord-self-mcp/test_bridge_china_news.py"
+      - "discord-self-mcp/smoke_china_news.py"
       - ".github/workflows/china-news-check.yml"
   workflow_dispatch:
 
@@ -24,3 +25,7 @@ jobs:
       - name: Run offline China News tests
         working-directory: discord-self-mcp
         run: python -m unittest -v test_bridge_china_news
+      - name: Check real news feeds and pictures (read-only)
+        working-directory: discord-self-mcp
+        timeout-minutes: 3
+        run: python smoke_china_news.py
