@@ -8,7 +8,7 @@ import re
 import sqlite3
 import time
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -71,33 +71,88 @@ def _article_url(raw: str) -> str:
 
 
 class _ArticleImageParser(HTMLParser):
+    """Prioriza a imagem principal do artigo, com fallback em fotos do corpo."""
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.images: list[str] = []
+        self.body_images: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
         if tag == "meta":
             name = (values.get("property") or values.get("name") or "").lower()
             if name in {"og:image", "og:image:url", "twitter:image", "twitter:image:src"}:
-                if values.get("content"):
-                    self.images.append(values["content"])
-        if tag == "link" and "image_src" in (values.get("rel") or "").lower():
+                url = values.get("content")
+                if url:
+                    self.images.append(url)
+        elif tag == "link" and "image_src" in (values.get("rel") or "").lower():
             if values.get("href"):
                 self.images.append(values["href"])
+        elif tag == "img":
+            # Jornais chineses frequentemente carregam fotos via atributos lazy-load.
+            for attribute in ("data-original", "data-src", "data-echo", "data-lazy", "src"):
+                url = values.get(attribute) or ""
+                if url and not url.startswith("data:") and not re.search(
+                    r"logo|avatar|icon|sprite|banner|tracking|pixel|advert|qr(code)?",
+                    url, flags=re.I
+                ):
+                    if url not in self.body_images:
+                        self.body_images.append(url)
+                    break
 
 
 def _feed_image(item: ET.Element) -> list[str]:
-    candidates = []
+    candidates: list[str] = []
     for elem in item.iter():
         kind = elem.tag.rsplit("}", 1)[-1].lower()
         if kind in ("thumbnail", "content", "enclosure", "image"):
-            for key in ("url", "href"):
-                if elem.attrib.get(key):
-                    candidates.append(elem.attrib[key])
+            url = elem.attrib.get("url") or elem.attrib.get("href") or ""
+            mime = (elem.attrib.get("type") or "").lower()
+            if url and (not mime or mime.startswith("image/")):
+                candidates.append(html.unescape(url))
     description = item.findtext("description") or ""
     candidates.extend(re.findall(r'<img[^>]+src=["\x27]([^"\x27]+)', description, flags=re.I))
-    return [html.unescape(url) for url in candidates if _public_url(html.unescape(url))]
+    return [html.unescape(url) for url in dict.fromkeys(candidates) if url.strip()]
+
+
+def _date_from_article_url(url: str) -> float:
+    """Datas explícitas de URLs de jornais, sem supor que artigos antigos são atuais."""
+    found = re.search(r"/(20\d{2})/(\d{2})[-/](\d{2})(?:/|[-.])", url)
+    if not found:
+        return 0
+    try:
+        return datetime(
+            *(int(part) for part in found.groups()),
+            tzinfo=timezone(timedelta(hours=8)),
+        ).timestamp()
+    except ValueError:
+        return 0
+
+
+def _published_timestamp(item: ET.Element, url: str) -> float:
+    value = item.findtext("pubDate") or ""
+    if not value:
+        for element in item.iter():
+            if element.tag.rsplit("}", 1)[-1].lower() in {"date", "published", "updated"}:
+                value = (element.text or "").strip()
+                if value:
+                    break
+    if value:
+        try:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone(timedelta(hours=8)))
+            return date.timestamp()
+        except (TypeError, ValueError, OverflowError):
+            pass
+        try:
+            date = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone(timedelta(hours=8)))
+            return date.timestamp()
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return _date_from_article_url(url)
 
 
 def _parse_rss(body: str, category: str) -> list[dict]:
@@ -111,14 +166,9 @@ def _parse_rss(body: str, category: str) -> list[dict]:
         url = _article_url(item.findtext("link") or "")
         if not url or not title or not re.search(r"[\u3400-\u9fff]", title):
             continue
-        published_text = item.findtext("pubDate") or ""
-        try:
-            published = parsedate_to_datetime(published_text).timestamp()
-        except (TypeError, ValueError, OverflowError):
-            published = 0
-        if not published or time.time() - published > MAX_AGE_HOURS * 3600:
-            continue
-        if published > time.time() + 3600:
+        published = _published_timestamp(item, url)
+        age = time.time() - published
+        if not published or age > MAX_AGE_HOURS * 3600 or age < -3600:
             continue
         entries.append({
             "title": title,
@@ -169,21 +219,49 @@ def _save_post(article: dict, message_id: int) -> None:
         db.commit()
 
 
+# RSS oficiais publicados pelo próprio China News Service (中新网).
+# As buscas Bing/Google ficam como fontes de reserva, não como únicas fontes.
+DIRECT_FEEDS = {
+    "国内": ("china.xml", "society.xml", "importnews.xml", "photo.xml"),
+    "地方": ("df.xml", "society.xml", "scroll-news.xml", "photo.xml"),
+    "娱乐": ("culture.xml", "ent.xml", "photo.xml"),
+}
+
+
+def _feed_urls(query: str, category: str) -> list[str]:
+    direct = [
+        f"https://www.chinanews.com.cn/rss/{name}"
+        for name in DIRECT_FEEDS.get(category, ())
+    ]
+    search = [
+        "https://www.bing.com/news/search?q=" + quote(query)
+        + "&format=rss&mkt=zh-CN&setlang=zh-Hans",
+        "https://news.google.com/rss/search?q=" + quote(query)
+        + "&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
+    ]
+    return direct + search
+
+
 async def _rss_results(http: httpx.AsyncClient, query: str, category: str) -> list[dict]:
-    feeds = (
-        "https://www.bing.com/news/search?q=" + quote(query) + "&format=rss&mkt=zh-CN&setlang=zh-Hans",
-        "https://news.google.com/rss/search?q=" + quote(query) + "&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
-    )
-    for feed in feeds:
+    errors: list[str] = []
+    # Procurar matérias em várias fontes, em vez de retornar somente a primeira
+    # com resultados (que pode não ter absolutamente nenhuma fotografia).
+    articles: dict[str, dict] = {}
+    for feed in _feed_urls(query, category):
         try:
-            response = await http.get(feed)
+            response = await http.get(feed, follow_redirects=True)
             response.raise_for_status()
             parsed = _parse_rss(response.text, category)
-            if parsed:
-                return sorted(parsed, key=lambda item: item["published"], reverse=True)
+            for item in parsed[:35]:
+                articles.setdefault(item["url"], item)
+            if len(articles) >= 40:
+                break
         except (httpx.HTTPError, ValueError) as exc:
-            print(f"[ChinaNews] RSS indisponível: {type(exc).__name__}", flush=True)
-    return []
+            errors.append(f"{urlsplit(feed).hostname}: {type(exc).__name__}")
+    if errors:
+        print("[ChinaNews] Feed errors: " + "; ".join(errors[:5]), flush=True)
+    print(f"[ChinaNews] category={category} valid_rss_articles={len(articles)}", flush=True)
+    return sorted(articles.values(), key=lambda item: item["published"], reverse=True)[:50]
 
 
 def _queries(post_count: int, category_override: str | None = None) -> list[tuple[str, str]]:
@@ -208,38 +286,45 @@ def _image_format(content: bytes, content_type: str) -> str | None:
     return None
 
 
-async def _download_image(http: httpx.AsyncClient, url: str) -> tuple[bytes, str] | None:
+async def _download_image(
+    http: httpx.AsyncClient, url: str, referrer: str = ""
+) -> tuple[bytes, str] | None:
     if not _public_url(url):
         return None
     try:
-        async with http.stream("GET", url, follow_redirects=True) as response:
+        headers = {"Referer": referrer} if referrer else {}
+        async with http.stream("GET", url, follow_redirects=True, headers=headers) as response:
             response.raise_for_status()
-            if not response.headers.get("content-type", "").lower().startswith("image/"):
+            kind = response.headers.get("content-type", "").lower()
+            if kind and not kind.startswith(("image/", "application/octet-stream")):
                 return None
             data = bytearray()
             async for block in response.aiter_bytes():
                 data.extend(block)
                 if len(data) > 5 * 1024 * 1024:
                     return None
-            ext = _image_format(bytes(data), response.headers.get("content-type", ""))
+            ext = _image_format(bytes(data), kind)
             return (bytes(data), ext) if ext else None
     except (httpx.HTTPError, ValueError):
         return None
 
 
 async def _article_image(http: httpx.AsyncClient, article: dict) -> tuple[bytes, str] | None:
-    urls = list(article["images"])
+    urls: list[str] = []
+    # Foto de capa extraída do artigo é preferível a miniaturas genéricas.
     try:
         response = await http.get(article["url"], follow_redirects=True)
         response.raise_for_status()
         if "text/html" in response.headers.get("content-type", ""):
             parser = _ArticleImageParser()
-            parser.feed(response.text[:250000])
+            parser.feed(response.text[:500000])
             urls.extend(urljoin(str(response.url), image) for image in parser.images)
+            urls.extend(urljoin(str(response.url), image) for image in parser.body_images[:15])
     except (httpx.HTTPError, ValueError):
         pass
+    urls.extend(urljoin(article["url"], image) for image in article["images"])
     for url in dict.fromkeys(urls):
-        image = await _download_image(http, url)
+        image = await _download_image(http, url, article["url"])
         if image:
             return image
     return None
@@ -353,7 +438,7 @@ class ChinaNewsService:
         ) as http:
             for query, category in _queries(count, category_override):
                 results = await _rss_results(http, query, category)
-                for article in results[:12]:
+                for article in results[:30]:
                     if article["url"] in seen:
                         continue
                     image = await _article_image(http, article)
@@ -370,7 +455,7 @@ class ChinaNewsService:
                     self.status["lastArticle"] = article["url"]
                     print(f"[ChinaNews] Publicado ({category}) {article['url']}", flush=True)
                     return {"ok": True, "messageId": str(message_id), "category": category, "url": article["url"]}
-        self.status["lastError"] = "Nenhuma notícia recente com imagem real disponível"
+        self.status["lastError"] = "Nenhuma notícia recente com imagem verificável disponível; consulte logs [ChinaNews]"
         return {"ok": False, "reason": self.status["lastError"]}
 
 
