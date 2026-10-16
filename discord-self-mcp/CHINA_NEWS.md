@@ -46,7 +46,7 @@ Digite no **servidor configurado**:
 - `!noticia provincia` (ou `!noticia província`) — notícia de província chinesa.
 - `!noticia fofoca` — notícia sobre entretenimento, celebridades ou fofocas.
 
-O comando publica no canal de notícias configurado, independentemente do canal onde for enviado, e responde com um link para a mensagem criada. Pula a espera de duas horas, mas **não repete matérias** e não ignora a exigência de imagem, fonte e tradução. Um novo envio manual só pode começar após 30 segundos, por padrão. A publicação manual também reinicia a contagem de 2 horas da rotina.
+O comando publica no canal de notícias configurado, independentemente do canal onde for enviado, e responde com um link para a mensagem criada. Pula a espera de duas horas, mas **não repete matérias** e não ignora a exigência de imagem, fonte e tradução. Um novo envio manual só pode começar após 30 segundos, por padrão. **A publicação manual não adia mais a publicação automática de duas em duas horas.** O relógio da rotina considera somente as postagens agendadas, inclusive após reinício, consultando o histórico do canal. No status, os campos `lastScheduledPosted` e `nextScheduledDue` mostram o agendamento em UTC.
 
 Por segurança, apenas a própria conta conectada, o dono do servidor ou os IDs relacionados em `CHINA_NEWS_ADMIN_IDS` podem ativá-lo. Os demais comandos do Greed são preservados.
 
