@@ -169,6 +169,42 @@ class ChinaNewsTests(unittest.TestCase):
         self.assertTrue(all(len(part) <= 650 for part in parts))
         self.assertEqual(" ".join(" ".join(parts).split()), " ".join(text.split()))
 
+    def test_manual_post_does_not_reset_two_hour_automatic_clock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(news, "DB_PATH", str(Path(tmp) / "news.sqlite3")):
+                with patch.object(news.time, "time", return_value=1234):
+                    news._save_post(
+                        {"url": "https://example.org/automatic", "category": "国内"},
+                        11, manual=False
+                    )
+                with patch.object(news.time, "time", return_value=4567):
+                    news._save_post(
+                        {"url": "https://example.org/manual", "category": "娱乐"},
+                        12, manual=True
+                    )
+                latest_automatic, count, _ = news._read_state()
+                self.assertEqual(latest_automatic, 1234)
+                self.assertEqual(count, 2)
+
+    def test_old_database_is_upgraded_with_mode_column(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "news.sqlite3")
+            with sqlite3.connect(db_path) as db:
+                db.execute(
+                    "CREATE TABLE articles (url TEXT PRIMARY KEY, published_at REAL NOT NULL, "
+                    "message_id TEXT NOT NULL, category TEXT NOT NULL)"
+                )
+                db.execute(
+                    "INSERT INTO articles VALUES ('https://example.org/legacy', 250, '1', '国内')"
+                )
+            with patch.object(news, "DB_PATH", db_path):
+                latest, count, _ = news._read_state()
+                self.assertEqual((latest, count), (250.0, 1))
+                with sqlite3.connect(db_path) as db:
+                    modes = {row[1] for row in db.execute("PRAGMA table_info(articles)")}
+                    self.assertIn("mode", modes)
+
     def test_db_persists_urls_and_time(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "news.sqlite3")
@@ -261,6 +297,36 @@ class ManualCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         await client.on_message(message)
         service.publish_now.assert_awaited_once_with("国内")
+
+    async def test_channel_history_detects_manual_even_before_marker_update(self):
+        from datetime import datetime, timezone
+        owner_id = 7654
+        def msg(t, content, author_id=owner_id):
+            return SimpleNamespace(
+                created_at=datetime.fromtimestamp(t, timezone.utc),
+                content=content,
+                author=SimpleNamespace(id=author_id),
+            )
+        originals = [
+            msg(1100, "!noticia"),
+            msg(1110, (
+                news.MARKER + " · 国内\n\n**标题**\n"
+                "🔗 原文：<https://example.org/manual>"
+            )),
+            msg(500, (
+                news.MARKER + " · 地方\n\n**标题**\n"
+                "🔗 原文：<https://example.org/automatic>"
+            )),
+        ]
+        async def history(limit):
+            for item in originals:
+                yield item
+        channel = SimpleNamespace(history=history)
+        auto_time, urls = await news._last_discord_post(channel, owner_id)
+        self.assertEqual(auto_time, 500)
+        self.assertEqual(
+            urls, {"https://example.org/manual", "https://example.org/automatic"}
+        )
 
     async def test_manual_bypasses_interval_with_cooldown(self):
         service = news.ChinaNewsService(SimpleNamespace(), AsyncMock())
