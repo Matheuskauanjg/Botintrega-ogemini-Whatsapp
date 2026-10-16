@@ -255,34 +255,42 @@ def _open_db() -> sqlite3.Connection:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(path, timeout=5)
-    except OSError:
+    except (OSError, sqlite3.Error):
         fallback = Path("/tmp/china_news.sqlite3")
         fallback.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(fallback, timeout=5)
     connection.execute(
         "CREATE TABLE IF NOT EXISTS articles "
-        "(url TEXT PRIMARY KEY, published_at REAL NOT NULL, message_id TEXT NOT NULL, category TEXT NOT NULL)"
+        "(url TEXT PRIMARY KEY, published_at REAL NOT NULL, message_id TEXT NOT NULL, "
+        "category TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'scheduled')"
     )
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(articles)")}
+    if "mode" not in columns:
+        connection.execute("ALTER TABLE articles ADD COLUMN mode TEXT NOT NULL DEFAULT 'scheduled'")
     connection.commit()
     return connection
 
 
 def _read_state() -> tuple[float, int, set[str]]:
+    """Horário da ÚLTIMA notícia agendada, ignorando notícias manuais."""
     with _open_db() as db:
-        latest, count = db.execute(
-            "SELECT COALESCE(MAX(published_at), 0), COUNT(*) FROM articles"
+        latest_auto, count = db.execute(
+            "SELECT COALESCE(MAX(CASE WHEN mode = 'scheduled' THEN published_at END), 0), "
+            "COUNT(*) FROM articles"
         ).fetchone()
         urls = {row[0] for row in db.execute(
             "SELECT url FROM articles WHERE published_at > ?", (time.time() - 30 * 86400,)
         )}
-    return float(latest), int(count), urls
+    return float(latest_auto), int(count), urls
 
 
-def _save_post(article: dict, message_id: int) -> None:
+def _save_post(article: dict, message_id: int, manual: bool = False) -> None:
     with _open_db() as db:
         db.execute(
-            "INSERT OR IGNORE INTO articles(url, published_at, message_id, category) VALUES (?, ?, ?, ?)",
-            (article["url"], time.time(), str(message_id), article["category"]),
+            "INSERT OR IGNORE INTO articles"
+            "(url, published_at, message_id, category, mode) VALUES (?, ?, ?, ?, ?)",
+            (article["url"], time.time(), str(message_id), article["category"],
+             "manual" if manual else "scheduled"),
         )
         db.commit()
 
@@ -403,15 +411,36 @@ async def _article_image(http: httpx.AsyncClient, article: dict) -> tuple[bytes,
     return None
 
 
-async def _last_discord_post(channel, own_id: int) -> float:
-    """Protege contra posts repetidos quando o armazenamento reinicia."""
+async def _last_discord_post(channel, own_id: int) -> tuple[float, set[str]]:
+    """Recupera a última notícia AUTOMÁTICA e URLs já postadas mesmo sem disco."""
+    latest_auto = 0.0
+    seen_urls: set[str] = set()
     try:
-        async for message in channel.history(limit=45):
-            if getattr(message.author, "id", None) == own_id and MARKER in (message.content or ""):
-                return message.created_at.timestamp()
+        messages = [item async for item in channel.history(limit=100)]
+        command_times = [
+            m.created_at.timestamp() for m in messages
+            if COMMAND_RE.fullmatch((m.content or "").strip())
+        ]
+        for message in messages:
+            if getattr(message.author, "id", None) != own_id:
+                continue
+            content = message.content or ""
+            if MARKER not in content:
+                continue
+            found = re.search(r"🔗 原文：<([^>]+)>", content)
+            if found:
+                seen_urls.add(found.group(1))
+            sent_at = message.created_at.timestamp()
+            # Identifica também posts manuais anteriores à atualização que
+            # ainda não usavam a indicação '手动发布'.
+            manual = "· 手动发布" in content or any(
+                0 <= sent_at - command_at <= 120 for command_at in command_times
+            )
+            if not manual:
+                latest_auto = max(latest_auto, sent_at)
     except Exception as exc:
         print(f"[ChinaNews] Histórico indisponível: {type(exc).__name__}", flush=True)
-    return 0.0
+    return latest_auto, seen_urls
 
 
 def _format_news_post(article: dict, chinese_text: str) -> str:
@@ -421,7 +450,8 @@ def _format_news_post(article: dict, chinese_text: str) -> str:
         f"\n🔗 原文：<{article['url']}>"
         "\n🇧🇷 葡语翻译请查看下方讨论串。"
     )
-    header = f"{MARKER} · {article['category']}\n\n**{article['title']}**\n\n"
+    mode = " · 手动发布" if article.get("_manual") else ""
+    header = f"{MARKER} · {article['category']}{mode}\n\n**{article['title']}**\n\n"
     room = 1950 - len(header) - len(footer)
     if room < 180:
         raise ValueError("Título ou URL da notícia muito compridos")
@@ -544,14 +574,23 @@ class ChinaNewsService:
             return await self._tick(force=True, category_override=category)
 
     async def _tick(self, force: bool = False, category_override: str | None = None) -> dict:
-        last_sent, count, seen = await asyncio.to_thread(_read_state)
-        if not force and time.time() - last_sent < INTERVAL:
-            return {"ok": False, "reason": "intervalo"}
+        last_auto, count, seen = await asyncio.to_thread(_read_state)
         channel = self.client.get_channel(CHANNEL_ID) or await self.client.fetch_channel(CHANNEL_ID)
         if getattr(channel, "guild", None) is None or not hasattr(channel, "send"):
             raise RuntimeError("Canal indisponível ou não é um canal de texto de servidor")
-        last_discord = await _last_discord_post(channel, self.client.user.id)
-        if not force and time.time() - max(last_sent, last_discord) < INTERVAL:
+        last_discord_auto, seen_on_discord = await _last_discord_post(
+            channel, self.client.user.id
+        )
+        seen.update(seen_on_discord)
+        anchor = max(last_auto, last_discord_auto)
+        self.status["lastScheduledPosted"] = (
+            datetime.fromtimestamp(anchor, timezone.utc).isoformat() if anchor else None
+        )
+        self.status["nextScheduledDue"] = (
+            datetime.fromtimestamp(anchor + INTERVAL, timezone.utc).isoformat()
+            if anchor else "as soon as the worker starts"
+        )
+        if not force and time.time() - anchor < INTERVAL:
             return {"ok": False, "reason": "intervalo"}
         self.status["lastAttempt"] = datetime.now(timezone.utc).isoformat()
         self.status["lastMode"] = "manual" if force else "scheduled"
@@ -584,9 +623,17 @@ class ChinaNewsService:
                     except ValueError:
                         print(f"[ChinaNews] Texto gerado muito curto: {article['url']}", flush=True)
                         continue
+                    article["_manual"] = force
                     message_id = await _publish(channel, article, image, chinese_text, translation)
-                    await asyncio.to_thread(_save_post, article, message_id)
+                    await asyncio.to_thread(_save_post, article, message_id, force)
                     self.status["lastPosted"] = datetime.now(timezone.utc).isoformat()
+                    if force:
+                        self.status["lastManualPosted"] = self.status["lastPosted"]
+                    else:
+                        self.status["lastScheduledPosted"] = self.status["lastPosted"]
+                        self.status["nextScheduledDue"] = datetime.fromtimestamp(
+                            time.time() + INTERVAL, timezone.utc
+                        ).isoformat()
                     self.status["lastError"] = None
                     self.status["lastArticle"] = article["url"]
                     print(f"[ChinaNews] Publicado ({category}) {article['url']}", flush=True)
