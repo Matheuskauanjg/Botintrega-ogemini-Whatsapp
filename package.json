@@ -2,12 +2,12 @@
   "name": "whatsapp-personal-render-launcher",
   "version": "1.0.1",
   "private": true,
-  "description": "Launcher da bridge pessoal WhatsApp para Render",
+  "description": "Render launcher for Discord self bridge (discord-self branch)",
   "scripts": {
-    "postinstall": "npm --prefix whatsapp-personal-render install --omit=dev",
-    "start": "npm --prefix whatsapp-personal-render start"
+    "postinstall": "npm --prefix discord-self-mcp install --omit=dev && python3 -m venv discord-self-mcp/.venv && discord-self-mcp/.venv/bin/pip install --upgrade pip && discord-self-mcp/.venv/bin/pip install -r discord-self-mcp/requirements.txt",
+    "start": "node src/index.js"
   },
   "engines": {
-    "node": "22.x"
+    "node": "24.x"
   }
 }
