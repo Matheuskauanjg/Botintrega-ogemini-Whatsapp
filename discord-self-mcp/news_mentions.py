@@ -41,7 +41,7 @@ def mention_rules() -> dict[str, list[str]]:
         if not re.fullmatch(r"\d{15,22}", str(user_id)) or not isinstance(keywords, list):
             continue
         cleaned = [str(k).strip() for k in keywords
-                   if isinstance(k, str) and 2 <= len(k.strip()) <= 60
+                   if isinstance(k, str) and 2 <= len(k.strip()) <= 60]
         if cleaned:
             result[str(user_id)] = cleaned[:20]
     return result
