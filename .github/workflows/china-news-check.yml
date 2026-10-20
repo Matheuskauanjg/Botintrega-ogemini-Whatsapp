@@ -6,6 +6,8 @@ on:
     paths:
       - "discord-self-mcp/bridge_china_news.py"
       - "discord-self-mcp/news_images.py"
+      - "discord-self-mcp/news_mentions.py"
+      - "discord-self-mcp/test_news_mentions.py"
       - "discord-self-mcp/test_news_images.py"
       - "discord-self-mcp/test_bridge_china_news.py"
       - ".github/workflows/china-news-check.yml"
@@ -34,7 +36,7 @@ jobs:
         run: python -m compileall -q discord-self-mcp
       - name: Run offline China News tests
         working-directory: discord-self-mcp
-        run: python -m unittest -v test_bridge_china_news test_news_images
+        run: python -m unittest -v test_bridge_china_news test_news_images test_news_mentions test_chat_routing
       - name: Check real news feeds and pictures (read-only)
         working-directory: discord-self-mcp
         timeout-minutes: 3
