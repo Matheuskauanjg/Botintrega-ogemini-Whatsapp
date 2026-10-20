@@ -44,11 +44,11 @@ class NewsMentionTests(unittest.TestCase):
                        "_mention_ids":["111111111111111111"]}
             news._save_post(article, 11)
             self.assertEqual(news._seen_mentions_db(), {"111111111111111111"})
-            with patch("news.matching_members", return_value=["111111111111111111", "222222222222222222"]):
+            with patch("bridge_china_news.matching_members", return_value=["111111111111111111", "222222222222222222"]):
                 self.assertEqual(news._select_daily_mentions(article, guild(),
                     news._seen_mentions_db(), 0), ["222222222222222222"])
             tomorrow = datetime.now(timezone.utc) + timedelta(days=2)
-            with patch("news.datetime") as mocked_datetime:
+            with patch("bridge_china_news.datetime") as mocked_datetime:
                 mocked_datetime.now.return_value = tomorrow
                 mocked_datetime.side_effect = datetime
                 self.assertEqual(news._seen_mentions_db(), set())
