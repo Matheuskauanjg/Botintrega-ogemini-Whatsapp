@@ -17,10 +17,10 @@ def _fold(text: str) -> str:
 
 def _contains_term(text: str, term: str) -> bool:
     word = _fold(term)
-    if len(word) < 3:
-        return False
     if re.search(r"[\u3400-\u9fff]", word):
-        return word in text
+        return len(word) >= 2 and word in text
+    if len(word) < 4:
+        return False
     return bool(re.search(rf"(?<!\w){re.escape(word)}(?!\w)", text))
 
 
@@ -41,7 +41,7 @@ def mention_rules() -> dict[str, list[str]]:
         if not re.fullmatch(r"\d{15,22}", str(user_id)) or not isinstance(keywords, list):
             continue
         cleaned = [str(k).strip() for k in keywords
-                   if isinstance(k, str) and 3 <= len(k.strip()) <= 60]
+                   if isinstance(k, str) and 2 <= len(k.strip()) <= 60
         if cleaned:
             result[str(user_id)] = cleaned[:20]
     return result
