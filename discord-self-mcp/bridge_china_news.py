@@ -636,7 +636,7 @@ class ChinaNewsService:
         self.translator = translator
         self.task: asyncio.Task | None = None
         self._publish_lock = asyncio.Lock()
-        self._last_manual_attempt = 0.0
+        self._last_manual_attempt: float | None = None
         self.status: dict = {
             "enabled": ENABLED,
             "channelId": str(CHANNEL_ID),
@@ -674,7 +674,8 @@ class ChinaNewsService:
             return {"ok": False, "reason": "Já estou procurando uma notícia. Tente novamente."}
         async with self._publish_lock:
             now = time.monotonic()
-            remaining = MANUAL_COOLDOWN - (now - self._last_manual_attempt)
+            remaining = (MANUAL_COOLDOWN - (now - self._last_manual_attempt)
+                         if self._last_manual_attempt is not None else 0.0)
             if remaining > 0:
                 return {"ok": False, "reason": f"Aguarde {int(remaining) + 1}s para usar o comando novamente."}
             self._last_manual_attempt = now
