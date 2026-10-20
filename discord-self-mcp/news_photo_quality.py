@@ -31,7 +31,7 @@ def is_news_photo(content: bytes) -> bool:
             small = ImageOps.exif_transpose(source).convert("RGB")
             small.thumbnail((64, 64))
             # A logo geralmente ocupa fundo sólido com 1-3 cores dominantes.
-            colors = Counter((r // 32, g // 32, b // 32) for r, g, b in small.getdata())
+            colors = Counter((r // 32, g // 32, b // 32) for r, g, b in small.get_flattened_data())
             dominant_share = max(colors.values()) / max(1, sum(colors.values()))
             return dominant_share <= 0.58 and len(colors) >= 15
     except (UnidentifiedImageError, OSError, ValueError):
