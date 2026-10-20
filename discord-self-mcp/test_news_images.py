@@ -62,7 +62,7 @@ class ImageSourceTests(unittest.TestCase):
                 "url": "https://commons.wikimedia.org/wiki/File:A.jpg",
             },
         }
-        content = _format_news_post(article, "据报道，这是一次重要的消息公布。" * 13)
+        content = _format_news_post(article, "据报道，这是一次重要的消息公布。" * 20)
         self.assertIn("示意配图", content)
         self.assertIn("Photographer", content)
         self.assertIn("CC BY-SA 4.0", content)
