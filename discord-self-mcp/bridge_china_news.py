@@ -21,6 +21,7 @@ from fastapi import Depends
 
 from news_images import find_illustrative_image
 from news_mentions import matching_members, mention_rules, MENTIONS_ENABLED
+from news_photo_quality import is_news_photo, image_fingerprint, has_duplicate_photo, reject_url
 
 CHANNEL_ID = int(os.getenv("CHINA_NEWS_CHANNEL_ID", "1560415874114920559"))
 GUILD_ID = int(os.getenv("CHINA_NEWS_GUILD_ID", "1251266361569710222"))
@@ -272,6 +273,8 @@ def _open_db() -> sqlite3.Connection:
     columns = {row[1] for row in connection.execute("PRAGMA table_info(articles)")}
     if "mode" not in columns:
         connection.execute("ALTER TABLE articles ADD COLUMN mode TEXT NOT NULL DEFAULT 'scheduled'")
+    if "image_hash" not in columns:
+        connection.execute("ALTER TABLE articles ADD COLUMN image_hash TEXT NOT NULL DEFAULT ''")
     connection.execute(
         "CREATE TABLE IF NOT EXISTS daily_mentions "
         "(day TEXT NOT NULL, member_id TEXT NOT NULL, article_url TEXT NOT NULL, "
@@ -301,6 +304,29 @@ def _select_daily_mentions(article: dict, guild, seen: set[str], own_id: int) ->
             if member_id not in seen]
 
 
+def _read_recent_image_hashes() -> set[int]:
+    """A imagem é registrada para impedir reutilização em notícias diferentes."""
+    with _open_db() as db:
+        rows = db.execute(
+            "SELECT image_hash FROM articles WHERE image_hash <> '' "
+            "AND published_at > ?", (time.time() - 30 * 86400,)
+        ).fetchall()
+        return {int(row[0], 16) for row in rows}
+
+
+def _image_not_repeated(article: dict, image: tuple[bytes, str],
+                        used_hashes: set[int]) -> bool:
+    try:
+        fingerprint = image_fingerprint(image[0])
+    except (OSError, ValueError):
+        return False
+    if has_duplicate_photo(fingerprint, used_hashes):
+        print(f"[ChinaNews] Foto repetida, buscando outra: {article['url']}", flush=True)
+        return False
+    article["_image_hash"] = f"{fingerprint:016x}"
+    return True
+
+
 def _read_state() -> tuple[float, int, set[str]]:
     """Horário da ÚLTIMA notícia agendada, ignorando notícias manuais."""
     with _open_db() as db:
@@ -318,9 +344,11 @@ def _save_post(article: dict, message_id: int, manual: bool = False) -> None:
     with _open_db() as db:
         db.execute(
             "INSERT OR IGNORE INTO articles"
-            "(url, published_at, message_id, category, mode) VALUES (?, ?, ?, ?, ?)",
+            "(url, published_at, message_id, category, mode, image_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
             (article["url"], time.time(), str(message_id), article["category"],
-             "manual" if manual else "scheduled"),
+             "manual" if manual else "scheduled",
+             article.get("_image_hash", "")),
         )
         if article.get("_mention_ids"):
             db.executemany(
@@ -402,7 +430,7 @@ def _image_format(content: bytes, content_type: str) -> str | None:
 async def _download_image(
     http: httpx.AsyncClient, url: str, referrer: str = ""
 ) -> tuple[bytes, str] | None:
-    if not _public_url(url):
+    if not _public_url(url) or reject_url(url):
         return None
     try:
         headers = {"Referer": referrer} if referrer else {}
@@ -416,13 +444,18 @@ async def _download_image(
                 data.extend(block)
                 if len(data) > 5 * 1024 * 1024:
                     return None
-            ext = _image_format(bytes(data), kind)
-            return (bytes(data), ext) if ext else None
+            raw = bytes(data)
+            ext = _image_format(raw, kind)
+            if not ext or not is_news_photo(raw):
+                return None
+            return raw, ext
     except (httpx.HTTPError, ValueError):
         return None
 
 
-async def _article_image(http: httpx.AsyncClient, article: dict) -> tuple[bytes, str] | None:
+async def _article_image(
+    http: httpx.AsyncClient, article: dict, used_hashes: set[int] | None = None
+) -> tuple[bytes, str] | None:
     urls: list[str] = []
     # Obtém conteúdo e fotos da mesma página, sem repetir o download do HTML.
     article["body_text"] = ""
@@ -442,8 +475,10 @@ async def _article_image(http: httpx.AsyncClient, article: dict) -> tuple[bytes,
         pass
     urls.extend(urljoin(article["url"], image) for image in article["images"])
     for url in dict.fromkeys(urls):
+        if reject_url(url):
+            continue
         image = await _download_image(http, url, article["url"])
-        if image:
+        if image and (used_hashes is None or _image_not_repeated(article, image, used_hashes)):
             return image
     return None
 
@@ -651,6 +686,7 @@ class ChinaNewsService:
         if getattr(channel, "guild", None) is None or not hasattr(channel, "send"):
             raise RuntimeError("Canal indisponível ou não é um canal de texto de servidor")
         seen_mentions = await asyncio.to_thread(_seen_mentions_db) if MENTIONS_ENABLED else set()
+        seen_photos = await asyncio.to_thread(_read_recent_image_hashes)
         last_discord_auto, seen_on_discord = await _last_discord_post(
             channel, self.client.user.id, mentioned_today=seen_mentions
         )
@@ -676,14 +712,17 @@ class ChinaNewsService:
                 for article in results[:30]:
                     if article["url"] in seen:
                         continue
-                    image = await _article_image(http, article)
+                    image = await _article_image(http, article, seen_photos)
                     # Para escrever um texto longo, a página precisa conter fatos suficientes.
                     body_text = article.get("body_text") or ""
                     if len(re.findall(r"[\u3400-\u9fff]", body_text)) < 220:
                         print(f"[ChinaNews] Conteúdo curto demais: {article['url']}", flush=True)
                         continue
                     if not image:
-                        image = await find_illustrative_image(http, article, _download_image)
+                        image = await find_illustrative_image(
+                            http, article, _download_image,
+                            validator=lambda candidate: _image_not_repeated(article, candidate, seen_photos),
+                        )
                     if not image:
                         print(f"[ChinaNews] Sem imagem de origem nem alternativa: {article['url']}", flush=True)
                         continue
@@ -706,6 +745,8 @@ class ChinaNewsService:
                     article["_manual"] = force
                     message_id = await _publish(channel, article, image, chinese_text, translation)
                     await asyncio.to_thread(_save_post, article, message_id, force)
+                    if article.get("_image_hash"):
+                        seen_photos.add(int(article["_image_hash"], 16))
                     seen_mentions.update(article.get("_mention_ids") or [])
                     if article.get("_mention_ids"):
                         print(f"[ChinaNews] Menções diárias: {len(article['_mention_ids'])} pessoa(s)", flush=True)
