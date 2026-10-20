@@ -11,6 +11,7 @@ from html import unescape
 from urllib.parse import urlsplit
 
 import httpx
+from news_photo_quality import reject_url
 
 EXTERNAL_IMAGES_ENABLED = os.getenv("CHINA_NEWS_EXTERNAL_IMAGES", "true").lower() in {"true", "1", "yes", "on"}
 
@@ -40,6 +41,9 @@ TOPICS = (
     ("足球", "football stadium"), ("体育", "sports stadium"),
     ("台风", "typhoon weather"), ("洪水", "flood"),
     ("地震", "earthquake damage"), ("消防", "firefighters"),
+    ("三峡", "Three Gorges Dam"), ("长江", "Yangtze River"), ("航运", "cargo ship"),
+    ("船闸", "shipping lock"), ("水运", "river shipping"),
+    ("大坝", "hydroelectric dam"), ("港口", "shipping port"),
     ("公园", "park"), ("城市", "city skyline"), ("建筑", "architecture"),
 )
 
@@ -49,9 +53,11 @@ def image_queries(article: dict) -> list[str]:
     title = re.sub(r"[\s【】（）()《》：“”‘’、，。；！？!?|]+", " ", article.get("title", "")).strip()
     location = next((english for chinese, english in LOCATIONS if chinese in title), "China")
     topic = next((english for chinese, english in TOPICS if chinese in title), "")
-    if not topic:
-        topic = "cinema and entertainment" if article.get("category") == "娱乐" else "landmark city"
-    candidates = [title[:75], f"{location} {topic}"]
+    # Never fall back to the same generic "China skyline" across unrelated stories.
+    # No identifiable topic: use the actual headline only, or try the next article.
+    candidates = [title[:75]]
+    if topic:
+        candidates.append(f"{location} {topic}")
     return [q for q in dict.fromkeys(candidates) if q and len(q) >= 3]
 
 
@@ -96,7 +102,7 @@ def _openverse_candidates(payload: dict) -> list[dict]:
             continue
         page = item.get("foreign_landing_url") or ""
         urls = [item.get("thumbnail") or "", item.get("url") or ""]
-        urls = [url for url in dict.fromkeys(urls) if _safe_public_url(url)]
+        urls = [url for url in dict.fromkeys(urls) if _safe_public_url(url) and not reject_url(url)]
         if not _safe_public_url(page) or not urls:
             continue
         candidates.append({
@@ -122,7 +128,7 @@ def _commons_candidates(payload: dict) -> list[dict]:
                 continue
             file_url = info.get("thumburl") or info.get("url") or ""
             page_url = info.get("descriptionurl") or ""
-            if not _safe_public_url(file_url) or not _safe_public_url(page_url):
+            if not _safe_public_url(file_url) or not _safe_public_url(page_url) or reject_url(file_url):
                 continue
             creator = _credit((ext.get("Artist") or {}).get("value") or "Wikimedia Commons")
             candidates.append({
@@ -134,7 +140,7 @@ def _commons_candidates(payload: dict) -> list[dict]:
     return candidates
 
 
-async def find_illustrative_image(http: httpx.AsyncClient, article: dict, download) -> tuple[bytes, str] | None:
+async def find_illustrative_image(http: httpx.AsyncClient, article: dict, download, validator=None) -> tuple[bytes, str] | None:
     """Busca e baixa somente imagens com licença conhecida; registra a atribuição."""
     if not EXTERNAL_IMAGES_ENABLED:
         return None
@@ -171,7 +177,7 @@ async def find_illustrative_image(http: httpx.AsyncClient, article: dict, downlo
             for item in candidates[:3]:
                 for url in item["urls"]:
                     picture = await download(http, url, item["page"])
-                    if picture:
+                    if picture and (validator is None or validator(picture)):
                         article["_illustrative"] = {
                             "creator": item["creator"],
                             "license": item["license"],

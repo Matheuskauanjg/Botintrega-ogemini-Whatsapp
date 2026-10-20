@@ -8,14 +8,17 @@ Serviço instalado automaticamente pelo módulo `bridge_chain.py` do `discord-se
 - **Intervalo:** 2 horas após a última notícia publicada com sucesso.
 - **Rotatividade:** notícias nacionais (`国内`), regionais (`地方`, alternando províncias) e celebridades/fofocas (`娱乐`).
 - **Fontes:** pesquisas RSS do Bing News e Google News em chinês; o link e o título são extraídos de itens reais, publicados nas últimas 96 horas.
-- **Imagem:** retirada dos metadados da matéria (`og:image` / `twitter:image`) ou da mídia indicada no RSS. A foto é baixada e anexada ao Discord para não depender de hotlink. Se a notícia não tiver uma foto válida, o bot pesquisa imagens tematicamente relacionadas no Openverse e Wikimedia Commons (com licenças abertas), baixa a foto e adiciona a identificação **imagem ilustrativa, não é foto do acontecimento**, com autor, licença e link da obra nas versões chinesa e portuguesa. Sem foto original nem alternativa licenciada validada, passa para outra notícia.
+- **Imagem:** retirada dos metadados da matéria (`og:image` / `twitter:image`) ou da mídia indicada no RSS. A foto é baixada e anexada ao Discord para não depender de hotlink. Se a notícia não tiver uma foto válida, o bot pesquisa imagens tematicamente relacionadas no Openverse e Wikimedia Commons (com licenças abertas), baixa a foto e adiciona a identificação **imagem ilustrativa, não é foto do acontecimento**, com autor, licença e link da obra nas versões chinesa e portuguesa. Fotos com aparência de logotipo, banner ou imagens muito pequenas são rejeitadas, e um hash perceptual impede reutilizar fotos iguais ou quase iguais em notícias diferentes. As buscas alternativas usam palavras ligadas ao assunto real, não paisagens genéricas da China. Sem foto original nem alternativa licenciada validada, passa para outra notícia.
 - **Redação expandida:** extrai o conteúdo da reportagem original e gera um resumo autoral em chinês (normalmente 4 a 6 parágrafos, dependendo dos fatos realmente disponíveis). Mantém o post principal abaixo de 2.000 caracteres, com a URL integral e a imagem.
 - **Tradução:** tradução para português brasileiro de todos os parágrafos produzidos em chinês, pelos provedores existentes (Gemini 1, Gemini 2, NVIDIA e Groq, nessa ordem). O tópico pode conter mais de uma mensagem para preservar a tradução completa. Não inventar informações além da reportagem original.
 - **Tópico:** cada mensagem em chinês origina um tópico público com a tradução em português e o mesmo link de fonte.
+- **Marcação contextual:** até duas pessoas por postagem, apenas membros do servidor cujo nome completo ou interesse explicitamente cadastrado combine com a manchete/resumo. No máximo **uma menção por pessoa por dia**, no fuso `America/Sao_Paulo`, mesmo em publicações manuais; controla em SQLite e consulta o histórico do canal após reinícios. Sem vínculo confiável não marca ninguém.
 - **Não repetição:** URLs publicadas em SQLite e verificação do histórico recente do canal.
 - **Falhas:** não publica quando faltar fonte, imagem ou tradução; tenta novamente depois, sem bloquear as outras funções.
 
 ## Configuração (Render)
+
+**Chat:** o Greed só conversa no canal https://discord.com/channels/1251266361569710222/1554920683786739712; menções em outros canais não ativam o chat. No canal indicado, uma menção inicia uma conversa com continuidade temporária.
 
 A rotina inicia por padrão com `BRIDGE_APP_MODULE=bridge_chain`. As variáveis abaixo são opcionais, pois já têm valores padrão:
 
@@ -25,6 +28,11 @@ CHINA_NEWS_CHANNEL_ID=1560415874114920559
 CHINA_NEWS_INTERVAL_SECONDS=7200
 CHINA_NEWS_MAX_AGE_HOURS=96
 CHINA_NEWS_EXTERNAL_IMAGES=true
+CHINA_NEWS_MENTIONS_ENABLED=true
+CHINA_NEWS_MENTION_TIME_ZONE=America/Sao_Paulo
+CHINA_NEWS_MAX_MENTIONS_PER_POST=2
+# Associe manualmente os IDs de membros aos interesses; formato JSON em uma linha:
+# CHINA_NEWS_MENTION_RULES={"123456789012345678":["足球","世界杯","futebol"]}
 CHINA_NEWS_DB_PATH=/data/china_news.sqlite3
 ```
 

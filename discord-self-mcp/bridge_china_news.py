@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from urllib.parse import parse_qs, quote, urljoin, urlsplit
 
 import discord
@@ -19,6 +20,8 @@ import httpx
 from fastapi import Depends
 
 from news_images import find_illustrative_image
+from news_mentions import matching_members, mention_rules, MENTIONS_ENABLED
+from news_photo_quality import is_news_photo, image_fingerprint, has_duplicate_photo, reject_url
 
 CHANNEL_ID = int(os.getenv("CHINA_NEWS_CHANNEL_ID", "1560415874114920559"))
 GUILD_ID = int(os.getenv("CHINA_NEWS_GUILD_ID", "1251266361569710222"))
@@ -35,6 +38,7 @@ ENABLED = os.getenv("CHINA_NEWS_ENABLED", "true").lower() in {"true", "1", "yes"
 INTERVAL = max(3600, int(os.getenv("CHINA_NEWS_INTERVAL_SECONDS", "7200")))
 MAX_AGE_HOURS = max(12, int(os.getenv("CHINA_NEWS_MAX_AGE_HOURS", "96")))
 DB_PATH = os.getenv("CHINA_NEWS_DB_PATH", "/data/china_news.sqlite3")
+MENTION_TIME_ZONE = os.getenv("CHINA_NEWS_MENTION_TIME_ZONE", "America/Sao_Paulo")
 MARKER = "📰 中国新闻速报"
 USER_AGENT = "Mozilla/5.0 (compatible; ChinaNewsDiscord/1.0; +https://github.com/)"
 CATEGORIES = ("国内", "地方", "娱乐")
@@ -269,8 +273,58 @@ def _open_db() -> sqlite3.Connection:
     columns = {row[1] for row in connection.execute("PRAGMA table_info(articles)")}
     if "mode" not in columns:
         connection.execute("ALTER TABLE articles ADD COLUMN mode TEXT NOT NULL DEFAULT 'scheduled'")
+    if "image_hash" not in columns:
+        connection.execute("ALTER TABLE articles ADD COLUMN image_hash TEXT NOT NULL DEFAULT ''")
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS daily_mentions "
+        "(day TEXT NOT NULL, member_id TEXT NOT NULL, article_url TEXT NOT NULL, "
+        "PRIMARY KEY(day, member_id))"
+    )
     connection.commit()
     return connection
+
+
+def _mention_day(now: datetime | None = None) -> str:
+    try:
+        zone = ZoneInfo(MENTION_TIME_ZONE)
+    except (ValueError, KeyError):
+        zone = ZoneInfo("America/Sao_Paulo")
+    return (now or datetime.now(timezone.utc)).astimezone(zone).date().isoformat()
+
+
+def _seen_mentions_db() -> set[str]:
+    with _open_db() as db:
+        return {row[0] for row in db.execute(
+            "SELECT member_id FROM daily_mentions WHERE day = ?", (_mention_day(),)
+        )}
+
+
+def _select_daily_mentions(article: dict, guild, seen: set[str], own_id: int) -> list[str]:
+    return [member_id for member_id in matching_members(article, guild, own_id)
+            if member_id not in seen]
+
+
+def _read_recent_image_hashes() -> set[int]:
+    """A imagem é registrada para impedir reutilização em notícias diferentes."""
+    with _open_db() as db:
+        rows = db.execute(
+            "SELECT image_hash FROM articles WHERE image_hash <> '' "
+            "AND published_at > ?", (time.time() - 30 * 86400,)
+        ).fetchall()
+        return {int(row[0], 16) for row in rows}
+
+
+def _image_not_repeated(article: dict, image: tuple[bytes, str],
+                        used_hashes: set[int]) -> bool:
+    try:
+        fingerprint = image_fingerprint(image[0])
+    except (OSError, ValueError):
+        return False
+    if has_duplicate_photo(fingerprint, used_hashes):
+        print(f"[ChinaNews] Foto repetida, buscando outra: {article['url']}", flush=True)
+        return False
+    article["_image_hash"] = f"{fingerprint:016x}"
+    return True
 
 
 def _read_state() -> tuple[float, int, set[str]]:
@@ -290,10 +344,19 @@ def _save_post(article: dict, message_id: int, manual: bool = False) -> None:
     with _open_db() as db:
         db.execute(
             "INSERT OR IGNORE INTO articles"
-            "(url, published_at, message_id, category, mode) VALUES (?, ?, ?, ?, ?)",
+            "(url, published_at, message_id, category, mode, image_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
             (article["url"], time.time(), str(message_id), article["category"],
-             "manual" if manual else "scheduled"),
+             "manual" if manual else "scheduled",
+             article.get("_image_hash", "")),
         )
+        if article.get("_mention_ids"):
+            db.executemany(
+                "INSERT OR IGNORE INTO daily_mentions (day, member_id, article_url) "
+                "VALUES (?, ?, ?)",
+                [(_mention_day(), user_id, article["url"])
+                 for user_id in article["_mention_ids"]]
+            )
         db.commit()
 
 
@@ -367,7 +430,7 @@ def _image_format(content: bytes, content_type: str) -> str | None:
 async def _download_image(
     http: httpx.AsyncClient, url: str, referrer: str = ""
 ) -> tuple[bytes, str] | None:
-    if not _public_url(url):
+    if not _public_url(url) or reject_url(url):
         return None
     try:
         headers = {"Referer": referrer} if referrer else {}
@@ -381,13 +444,18 @@ async def _download_image(
                 data.extend(block)
                 if len(data) > 5 * 1024 * 1024:
                     return None
-            ext = _image_format(bytes(data), kind)
-            return (bytes(data), ext) if ext else None
+            raw = bytes(data)
+            ext = _image_format(raw, kind)
+            if not ext or not is_news_photo(raw):
+                return None
+            return raw, ext
     except (httpx.HTTPError, ValueError):
         return None
 
 
-async def _article_image(http: httpx.AsyncClient, article: dict) -> tuple[bytes, str] | None:
+async def _article_image(
+    http: httpx.AsyncClient, article: dict, used_hashes: set[int] | None = None
+) -> tuple[bytes, str] | None:
     urls: list[str] = []
     # Obtém conteúdo e fotos da mesma página, sem repetir o download do HTML.
     article["body_text"] = ""
@@ -407,13 +475,15 @@ async def _article_image(http: httpx.AsyncClient, article: dict) -> tuple[bytes,
         pass
     urls.extend(urljoin(article["url"], image) for image in article["images"])
     for url in dict.fromkeys(urls):
+        if reject_url(url):
+            continue
         image = await _download_image(http, url, article["url"])
-        if image:
+        if image and (used_hashes is None or _image_not_repeated(article, image, used_hashes)):
             return image
     return None
 
 
-async def _last_discord_post(channel, own_id: int) -> tuple[float, set[str]]:
+async def _last_discord_post(channel, own_id: int, mentioned_today: set[str] | None = None) -> tuple[float, set[str]]:
     """Recupera a última notícia AUTOMÁTICA e URLs já postadas mesmo sem disco."""
     latest_auto = 0.0
     seen_urls: set[str] = set()
@@ -433,6 +503,10 @@ async def _last_discord_post(channel, own_id: int) -> tuple[float, set[str]]:
             if found:
                 seen_urls.add(found.group(1))
             sent_at = message.created_at.timestamp()
+            if mentioned_today is not None and _mention_day(message.created_at) == _mention_day():
+                tag_line = re.search(r"🔔 相关成员：([^\n]+)", content)
+                if tag_line:
+                    mentioned_today.update(re.findall(r"<@!?(\d{15,22})>", tag_line.group(1)))
             # Identifica também posts manuais anteriores à atualização que
             # ainda não usavam a indicação '手动发布'.
             manual = "· 手动发布" in content or any(
@@ -472,6 +546,10 @@ def _format_news_post(article: dict, chinese_text: str) -> str:
         "\n🇧🇷 葡语翻译请查看下方讨论串。"
     )
     footer += _image_credit_line(article)
+    if article.get("_mention_ids"):
+        footer += "\n🔔 相关成员：" + " ".join(
+            f"<@{user_id}>" for user_id in article["_mention_ids"]
+        )
     mode = " · 手动发布" if article.get("_manual") else ""
     header = f"{MARKER} · {article['category']}{mode}\n\n**{article['title']}**\n\n"
     room = 1950 - len(header) - len(footer)
@@ -528,7 +606,9 @@ async def _publish(
 ) -> int:
     content = _format_news_post(article, chinese_text)
     file = discord.File(io.BytesIO(image[0]), filename=f"china-news.{image[1]}")
-    posted = await channel.send(content=content, file=file)
+    # Restringe pings: nunca @everyone/@here ou cargos por acidente.
+    mention_policy = discord.AllowedMentions(users=True, everyone=False, roles=False, replied_user=False)
+    posted = await channel.send(content=content, file=file, allowed_mentions=mention_policy)
     try:
         thread = await posted.create_thread(name=f"🇧🇷 Tradução | {article['title'][:63]}")
         translated = (
@@ -556,13 +636,17 @@ class ChinaNewsService:
         self.translator = translator
         self.task: asyncio.Task | None = None
         self._publish_lock = asyncio.Lock()
-        self._last_manual_attempt = 0.0
+        self._last_manual_attempt: float | None = None
         self.status: dict = {
             "enabled": ENABLED,
             "channelId": str(CHANNEL_ID),
             "guildId": str(GUILD_ID),
             "manualCommand": "!noticia [nacional|provincia|fofoca]",
             "intervalSeconds": INTERVAL,
+            "mentionsEnabled": MENTIONS_ENABLED,
+            "mentionRuleUserCount": len(mention_rules()),
+            "mentionLimit": "1 per member per day",
+            "mentionTimeZone": MENTION_TIME_ZONE,
             "lastPosted": None,
             "lastError": None,
         }
@@ -590,7 +674,8 @@ class ChinaNewsService:
             return {"ok": False, "reason": "Já estou procurando uma notícia. Tente novamente."}
         async with self._publish_lock:
             now = time.monotonic()
-            remaining = MANUAL_COOLDOWN - (now - self._last_manual_attempt)
+            remaining = (MANUAL_COOLDOWN - (now - self._last_manual_attempt)
+                         if self._last_manual_attempt is not None else 0.0)
             if remaining > 0:
                 return {"ok": False, "reason": f"Aguarde {int(remaining) + 1}s para usar o comando novamente."}
             self._last_manual_attempt = now
@@ -601,8 +686,10 @@ class ChinaNewsService:
         channel = self.client.get_channel(CHANNEL_ID) or await self.client.fetch_channel(CHANNEL_ID)
         if getattr(channel, "guild", None) is None or not hasattr(channel, "send"):
             raise RuntimeError("Canal indisponível ou não é um canal de texto de servidor")
+        seen_mentions = await asyncio.to_thread(_seen_mentions_db) if MENTIONS_ENABLED else set()
+        seen_photos = await asyncio.to_thread(_read_recent_image_hashes)
         last_discord_auto, seen_on_discord = await _last_discord_post(
-            channel, self.client.user.id
+            channel, self.client.user.id, mentioned_today=seen_mentions
         )
         seen.update(seen_on_discord)
         anchor = max(last_auto, last_discord_auto)
@@ -626,14 +713,17 @@ class ChinaNewsService:
                 for article in results[:30]:
                     if article["url"] in seen:
                         continue
-                    image = await _article_image(http, article)
+                    image = await _article_image(http, article, seen_photos)
                     # Para escrever um texto longo, a página precisa conter fatos suficientes.
                     body_text = article.get("body_text") or ""
                     if len(re.findall(r"[\u3400-\u9fff]", body_text)) < 220:
                         print(f"[ChinaNews] Conteúdo curto demais: {article['url']}", flush=True)
                         continue
                     if not image:
-                        image = await find_illustrative_image(http, article, _download_image)
+                        image = await find_illustrative_image(
+                            http, article, _download_image,
+                            validator=lambda candidate: _image_not_repeated(article, candidate, seen_photos),
+                        )
                     if not image:
                         print(f"[ChinaNews] Sem imagem de origem nem alternativa: {article['url']}", flush=True)
                         continue
@@ -644,6 +734,10 @@ class ChinaNewsService:
                         self.status["lastError"] = "Provedores de redação/tradução indisponíveis"
                         return {"ok": False, "reason": self.status["lastError"]}
                     chinese_text, translation = editorial
+                    if MENTIONS_ENABLED:
+                        article["_mention_ids"] = _select_daily_mentions(
+                            article, channel.guild, seen_mentions, self.client.user.id
+                        )
                     try:
                         _format_news_post(article, chinese_text)
                     except ValueError:
@@ -652,6 +746,11 @@ class ChinaNewsService:
                     article["_manual"] = force
                     message_id = await _publish(channel, article, image, chinese_text, translation)
                     await asyncio.to_thread(_save_post, article, message_id, force)
+                    if article.get("_image_hash"):
+                        seen_photos.add(int(article["_image_hash"], 16))
+                    seen_mentions.update(article.get("_mention_ids") or [])
+                    if article.get("_mention_ids"):
+                        print(f"[ChinaNews] Menções diárias: {len(article['_mention_ids'])} pessoa(s)", flush=True)
                     self.status["lastPosted"] = datetime.now(timezone.utc).isoformat()
                     if force:
                         self.status["lastManualPosted"] = self.status["lastPosted"]
