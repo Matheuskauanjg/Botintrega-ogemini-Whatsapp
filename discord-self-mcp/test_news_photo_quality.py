@@ -66,7 +66,7 @@ class NewsPhotoTests(unittest.TestCase):
                 self.assertTrue(news._image_not_repeated(b, (photo(31), "jpg"), used))
 
     def test_no_generic_china_landmark_picture(self):
-        queries = image_queries({"title": "今日经济新闻发布", "category": "国内"})
+        queries = image_queries({"title": "今日突发重要会议举行", "category": "国内"})
         self.assertEqual(len(queries), 1)
         self.assertNotIn("landmark city", str(queries))
         specific = image_queries({"title": "三峡水运新通道取得进展", "category": "国内"})
