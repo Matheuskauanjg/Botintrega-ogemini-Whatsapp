@@ -13,6 +13,7 @@ import httpx
 from fastapi import Depends
 from greed_persona import dogao_guidance
 from bridge_draw import COMMAND_RE as DRAW_COMMAND_RE
+from chat_routing import directly_mentions, replies_to_self, active_followup, session_key
 
 import bridge_download as stack
 
@@ -24,6 +25,7 @@ client = base.client
 AUTO_REPLY_ENABLED = os.getenv("AUTO_REPLY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 AUTO_REPLY_GUILD_ID = os.getenv("AUTO_REPLY_GUILD_ID", "1251266361569710222").strip()
 AUTO_REPLY_CHANNEL_ID = os.getenv("AUTO_REPLY_CHANNEL_ID", "1554920683786739712").strip()
+AUTO_REPLY_CONVERSATION_SECONDS = max(30.0, min(1800.0, float(os.getenv("AUTO_REPLY_CONVERSATION_SECONDS", "420"))))
 AUTO_REPLY_TRIGGERS = [
     item.casefold().strip()
     for item in os.getenv("AUTO_REPLY_TRIGGERS", "grade,greed").split(",")
@@ -43,6 +45,7 @@ AUTO_REPLY_MAX_CONCURRENT = max(1, min(4, int(os.getenv("AUTO_REPLY_MAX_CONCURRE
 GROQ_AUTO_REPLY_MODEL = os.getenv("GROQ_AUTO_REPLY_MODEL", "openai/gpt-oss-120b").strip()
 
 _last_reply_at: dict[tuple[int, int], float] = defaultdict(float)
+_active_conversations: dict[tuple[int, int, int], float] = {}
 _last_seen_message: dict[tuple[int, int, str], float] = {}
 _recent_bot_replies: deque[str] = deque(maxlen=12)
 _generation_semaphore = asyncio.Semaphore(AUTO_REPLY_MAX_CONCURRENT)
@@ -560,10 +563,6 @@ async def on_message(message) -> None:
         return
 
     channel_id = str(getattr(getattr(message, "channel", None), "id", ""))
-    if AUTO_REPLY_CHANNEL_ID and channel_id != AUTO_REPLY_CHANNEL_ID:
-        auto_reply_stats["skippedChannel"] += 1
-        return
-
     # A drawing request must never trigger a text-only auto-reply.
     # Reuse the exact parser installed by the image handler.
     if (
@@ -573,12 +572,25 @@ async def on_message(message) -> None:
         return
 
     matched, trigger = _trigger_match(message)
-    if not matched:
+    direct_mention = directly_mentions(message, client.user.id)
+    # Menções ou respostas diretas devem funcionar em qualquer canal do servidor.
+    direct_reply = await replies_to_self(message, client.user.id) if not direct_mention else False
+    now = time.monotonic()
+    followup = active_followup(message, _active_conversations, now)
+    in_main_channel = not AUTO_REPLY_CHANNEL_ID or channel_id == AUTO_REPLY_CHANNEL_ID
+    if direct_mention:
+        trigger = "mention"
+    elif direct_reply:
+        trigger = "reply"
+    elif followup:
+        trigger = "conversation"
+    elif not (in_main_channel and matched):
+        if matched and not in_main_channel:
+            auto_reply_stats["skippedChannel"] += 1
         return
 
     normalized_message = _normalize(_clean_message_text(message))
     duplicate_key = (int(message.channel.id), int(author.id), normalized_message)
-    now = time.monotonic()
     previous_seen = _last_seen_message.get(duplicate_key, 0.0)
     if normalized_message and AUTO_REPLY_DUPLICATE_WINDOW_SECONDS and now - previous_seen < AUTO_REPLY_DUPLICATE_WINDOW_SECONDS:
         auto_reply_stats["skippedDuplicate"] += 1
@@ -638,6 +650,12 @@ async def on_message(message) -> None:
                 await asyncio.sleep(0.15)
 
         auto_reply_stats["replied"] += 1
+        _active_conversations[session_key(message)] = time.monotonic() + AUTO_REPLY_CONVERSATION_SECONDS
+        if len(_active_conversations) > 500:
+            cutoff = time.monotonic()
+            for session, deadline in list(_active_conversations.items()):
+                if deadline <= cutoff:
+                    _active_conversations.pop(session, None)
         auto_reply_stats["lastReplyAt"] = time.time()
         auto_reply_stats["lastReplyChunks"] = len(chunks)
         print(
@@ -656,6 +674,10 @@ async def auto_reply_status() -> dict[str, Any]:
         "channelId": AUTO_REPLY_CHANNEL_ID,
         "triggers": AUTO_REPLY_TRIGGERS,
         "mentionTrigger": True,
+        "replyToSelfTrigger": True,
+        "crossChannelDirectMentions": True,
+        "conversationSeconds": AUTO_REPLY_CONVERSATION_SECONDS,
+        "activeConversationSessions": len(_active_conversations),
         "allowSelfTrigger": AUTO_REPLY_ALLOW_SELF,
         "cooldownSeconds": AUTO_REPLY_COOLDOWN_SECONDS,
         "duplicateWindowSeconds": AUTO_REPLY_DUPLICATE_WINDOW_SECONDS,
