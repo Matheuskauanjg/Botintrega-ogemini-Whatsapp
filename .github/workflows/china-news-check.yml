@@ -1,10 +1,20 @@
 name: China News checks
 
 on:
+  pull_request:
+    branches: [discord-self]
+    paths:
+      - "discord-self-mcp/bridge_china_news.py"
+      - "discord-self-mcp/news_images.py"
+      - "discord-self-mcp/test_news_images.py"
+      - "discord-self-mcp/test_bridge_china_news.py"
+      - ".github/workflows/china-news-check.yml"
   push:
     branches: [discord-self]
     paths:
       - "discord-self-mcp/bridge_china_news.py"
+      - "discord-self-mcp/news_images.py"
+      - "discord-self-mcp/test_news_images.py"
       - "discord-self-mcp/test_bridge_china_news.py"
       - "discord-self-mcp/smoke_china_news.py"
       - ".github/workflows/china-news-check.yml"
@@ -24,7 +34,7 @@ jobs:
         run: python -m compileall -q discord-self-mcp
       - name: Run offline China News tests
         working-directory: discord-self-mcp
-        run: python -m unittest -v test_bridge_china_news
+        run: python -m unittest -v test_bridge_china_news test_news_images
       - name: Check real news feeds and pictures (read-only)
         working-directory: discord-self-mcp
         timeout-minutes: 3
