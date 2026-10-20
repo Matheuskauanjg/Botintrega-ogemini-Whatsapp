@@ -12,6 +12,7 @@ Serviço instalado automaticamente pelo módulo `bridge_chain.py` do `discord-se
 - **Redação expandida:** extrai o conteúdo da reportagem original e gera um resumo autoral em chinês (normalmente 4 a 6 parágrafos, dependendo dos fatos realmente disponíveis). Mantém o post principal abaixo de 2.000 caracteres, com a URL integral e a imagem.
 - **Tradução:** tradução para português brasileiro de todos os parágrafos produzidos em chinês, pelos provedores existentes (Gemini 1, Gemini 2, NVIDIA e Groq, nessa ordem). O tópico pode conter mais de uma mensagem para preservar a tradução completa. Não inventar informações além da reportagem original.
 - **Tópico:** cada mensagem em chinês origina um tópico público com a tradução em português e o mesmo link de fonte.
+- **Marcação contextual:** até duas pessoas por postagem, apenas membros do servidor cujo nome completo ou interesse explicitamente cadastrado combine com a manchete/resumo. No máximo **uma menção por pessoa por dia**, no fuso `America/Sao_Paulo`, mesmo em publicações manuais; controla em SQLite e consulta o histórico do canal após reinícios. Sem vínculo confiável não marca ninguém.
 - **Não repetição:** URLs publicadas em SQLite e verificação do histórico recente do canal.
 - **Falhas:** não publica quando faltar fonte, imagem ou tradução; tenta novamente depois, sem bloquear as outras funções.
 
@@ -25,6 +26,11 @@ CHINA_NEWS_CHANNEL_ID=1560415874114920559
 CHINA_NEWS_INTERVAL_SECONDS=7200
 CHINA_NEWS_MAX_AGE_HOURS=96
 CHINA_NEWS_EXTERNAL_IMAGES=true
+CHINA_NEWS_MENTIONS_ENABLED=true
+CHINA_NEWS_MENTION_TIME_ZONE=America/Sao_Paulo
+CHINA_NEWS_MAX_MENTIONS_PER_POST=2
+# Associe manualmente os IDs de membros aos interesses; formato JSON em uma linha:
+# CHINA_NEWS_MENTION_RULES={"123456789012345678":["足球","世界杯","futebol"]}
 CHINA_NEWS_DB_PATH=/data/china_news.sqlite3
 ```
 
