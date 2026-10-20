@@ -563,6 +563,11 @@ async def on_message(message) -> None:
         return
 
     channel_id = str(getattr(getattr(message, "channel", None), "id", ""))
+    # Chat responses belong exclusively to the configured conversation channel.
+    if channel_id != AUTO_REPLY_CHANNEL_ID:
+        auto_reply_stats["skippedChannel"] += 1
+        return
+
     # A drawing request must never trigger a text-only auto-reply.
     # Reuse the exact parser installed by the image handler.
     if (
@@ -573,20 +578,17 @@ async def on_message(message) -> None:
 
     matched, trigger = _trigger_match(message)
     direct_mention = directly_mentions(message, client.user.id)
-    # Menções ou respostas diretas devem funcionar em qualquer canal do servidor.
+    # Menções e respostas diretas acionam o chat apenas neste canal.
     direct_reply = await replies_to_self(message, client.user.id) if not direct_mention else False
     now = time.monotonic()
     followup = active_followup(message, _active_conversations, now)
-    in_main_channel = not AUTO_REPLY_CHANNEL_ID or channel_id == AUTO_REPLY_CHANNEL_ID
     if direct_mention:
         trigger = "mention"
     elif direct_reply:
         trigger = "reply"
     elif followup:
         trigger = "conversation"
-    elif not (in_main_channel and matched):
-        if matched and not in_main_channel:
-            auto_reply_stats["skippedChannel"] += 1
+    elif not matched:
         return
 
     normalized_message = _normalize(_clean_message_text(message))
@@ -675,7 +677,8 @@ async def auto_reply_status() -> dict[str, Any]:
         "triggers": AUTO_REPLY_TRIGGERS,
         "mentionTrigger": True,
         "replyToSelfTrigger": True,
-        "crossChannelDirectMentions": True,
+        "crossChannelDirectMentions": False,
+        "chatOnlyChannelId": AUTO_REPLY_CHANNEL_ID,
         "conversationSeconds": AUTO_REPLY_CONVERSATION_SECONDS,
         "activeConversationSessions": len(_active_conversations),
         "allowSelfTrigger": AUTO_REPLY_ALLOW_SELF,
