@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from urllib.parse import parse_qs, quote, urljoin, urlsplit
 
 import discord
@@ -19,6 +20,7 @@ import httpx
 from fastapi import Depends
 
 from news_images import find_illustrative_image
+from news_mentions import matching_members, mention_rules, MENTIONS_ENABLED
 
 CHANNEL_ID = int(os.getenv("CHINA_NEWS_CHANNEL_ID", "1560415874114920559"))
 GUILD_ID = int(os.getenv("CHINA_NEWS_GUILD_ID", "1251266361569710222"))
@@ -35,6 +37,7 @@ ENABLED = os.getenv("CHINA_NEWS_ENABLED", "true").lower() in {"true", "1", "yes"
 INTERVAL = max(3600, int(os.getenv("CHINA_NEWS_INTERVAL_SECONDS", "7200")))
 MAX_AGE_HOURS = max(12, int(os.getenv("CHINA_NEWS_MAX_AGE_HOURS", "96")))
 DB_PATH = os.getenv("CHINA_NEWS_DB_PATH", "/data/china_news.sqlite3")
+MENTION_TIME_ZONE = os.getenv("CHINA_NEWS_MENTION_TIME_ZONE", "America/Sao_Paulo")
 MARKER = "📰 中国新闻速报"
 USER_AGENT = "Mozilla/5.0 (compatible; ChinaNewsDiscord/1.0; +https://github.com/)"
 CATEGORIES = ("国内", "地方", "娱乐")
@@ -269,8 +272,33 @@ def _open_db() -> sqlite3.Connection:
     columns = {row[1] for row in connection.execute("PRAGMA table_info(articles)")}
     if "mode" not in columns:
         connection.execute("ALTER TABLE articles ADD COLUMN mode TEXT NOT NULL DEFAULT 'scheduled'")
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS daily_mentions "
+        "(day TEXT NOT NULL, member_id TEXT NOT NULL, article_url TEXT NOT NULL, "
+        "PRIMARY KEY(day, member_id))"
+    )
     connection.commit()
     return connection
+
+
+def _mention_day(now: datetime | None = None) -> str:
+    try:
+        zone = ZoneInfo(MENTION_TIME_ZONE)
+    except (ValueError, KeyError):
+        zone = ZoneInfo("America/Sao_Paulo")
+    return (now or datetime.now(timezone.utc)).astimezone(zone).date().isoformat()
+
+
+def _seen_mentions_db() -> set[str]:
+    with _open_db() as db:
+        return {row[0] for row in db.execute(
+            "SELECT member_id FROM daily_mentions WHERE day = ?", (_mention_day(),)
+        )}
+
+
+def _select_daily_mentions(article: dict, guild, seen: set[str], own_id: int) -> list[str]:
+    return [member_id for member_id in matching_members(article, guild, own_id)
+            if member_id not in seen]
 
 
 def _read_state() -> tuple[float, int, set[str]]:
@@ -294,6 +322,13 @@ def _save_post(article: dict, message_id: int, manual: bool = False) -> None:
             (article["url"], time.time(), str(message_id), article["category"],
              "manual" if manual else "scheduled"),
         )
+        if article.get("_mention_ids"):
+            db.executemany(
+                "INSERT OR IGNORE INTO daily_mentions (day, member_id, article_url) "
+                "VALUES (?, ?, ?)",
+                [(_mention_day(), user_id, article["url"])
+                 for user_id in article["_mention_ids"]]
+            )
         db.commit()
 
 
@@ -413,7 +448,7 @@ async def _article_image(http: httpx.AsyncClient, article: dict) -> tuple[bytes,
     return None
 
 
-async def _last_discord_post(channel, own_id: int) -> tuple[float, set[str]]:
+async def _last_discord_post(channel, own_id: int, mentioned_today: set[str] | None = None) -> tuple[float, set[str]]:
     """Recupera a última notícia AUTOMÁTICA e URLs já postadas mesmo sem disco."""
     latest_auto = 0.0
     seen_urls: set[str] = set()
@@ -433,6 +468,10 @@ async def _last_discord_post(channel, own_id: int) -> tuple[float, set[str]]:
             if found:
                 seen_urls.add(found.group(1))
             sent_at = message.created_at.timestamp()
+            if mentioned_today is not None and _mention_day(message.created_at) == _mention_day():
+                tag_line = re.search(r"🔔 相关成员：([^\n]+)", content)
+                if tag_line:
+                    mentioned_today.update(re.findall(r"<@!?(\d{15,22})>", tag_line.group(1)))
             # Identifica também posts manuais anteriores à atualização que
             # ainda não usavam a indicação '手动发布'.
             manual = "· 手动发布" in content or any(
@@ -472,6 +511,10 @@ def _format_news_post(article: dict, chinese_text: str) -> str:
         "\n🇧🇷 葡语翻译请查看下方讨论串。"
     )
     footer += _image_credit_line(article)
+    if article.get("_mention_ids"):
+        footer += "\n🔔 相关成员：" + " ".join(
+            f"<@{user_id}>" for user_id in article["_mention_ids"]
+        )
     mode = " · 手动发布" if article.get("_manual") else ""
     header = f"{MARKER} · {article['category']}{mode}\n\n**{article['title']}**\n\n"
     room = 1950 - len(header) - len(footer)
@@ -528,7 +571,9 @@ async def _publish(
 ) -> int:
     content = _format_news_post(article, chinese_text)
     file = discord.File(io.BytesIO(image[0]), filename=f"china-news.{image[1]}")
-    posted = await channel.send(content=content, file=file)
+    # Restringe pings: nunca @everyone/@here ou cargos por acidente.
+    mention_policy = discord.AllowedMentions(users=True, everyone=False, roles=False, replied_user=False)
+    posted = await channel.send(content=content, file=file, allowed_mentions=mention_policy)
     try:
         thread = await posted.create_thread(name=f"🇧🇷 Tradução | {article['title'][:63]}")
         translated = (
@@ -563,6 +608,10 @@ class ChinaNewsService:
             "guildId": str(GUILD_ID),
             "manualCommand": "!noticia [nacional|provincia|fofoca]",
             "intervalSeconds": INTERVAL,
+            "mentionsEnabled": MENTIONS_ENABLED,
+            "mentionRuleUserCount": len(mention_rules()),
+            "mentionLimit": "1 per member per day",
+            "mentionTimeZone": MENTION_TIME_ZONE,
             "lastPosted": None,
             "lastError": None,
         }
@@ -601,8 +650,9 @@ class ChinaNewsService:
         channel = self.client.get_channel(CHANNEL_ID) or await self.client.fetch_channel(CHANNEL_ID)
         if getattr(channel, "guild", None) is None or not hasattr(channel, "send"):
             raise RuntimeError("Canal indisponível ou não é um canal de texto de servidor")
+        seen_mentions = await asyncio.to_thread(_seen_mentions_db) if MENTIONS_ENABLED else set()
         last_discord_auto, seen_on_discord = await _last_discord_post(
-            channel, self.client.user.id
+            channel, self.client.user.id, mentioned_today=seen_mentions
         )
         seen.update(seen_on_discord)
         anchor = max(last_auto, last_discord_auto)
@@ -644,6 +694,10 @@ class ChinaNewsService:
                         self.status["lastError"] = "Provedores de redação/tradução indisponíveis"
                         return {"ok": False, "reason": self.status["lastError"]}
                     chinese_text, translation = editorial
+                    if MENTIONS_ENABLED:
+                        article["_mention_ids"] = _select_daily_mentions(
+                            article, channel.guild, seen_mentions, self.client.user.id
+                        )
                     try:
                         _format_news_post(article, chinese_text)
                     except ValueError:
@@ -652,6 +706,9 @@ class ChinaNewsService:
                     article["_manual"] = force
                     message_id = await _publish(channel, article, image, chinese_text, translation)
                     await asyncio.to_thread(_save_post, article, message_id, force)
+                    seen_mentions.update(article.get("_mention_ids") or [])
+                    if article.get("_mention_ids"):
+                        print(f"[ChinaNews] Menções diárias: {len(article['_mention_ids'])} pessoa(s)", flush=True)
                     self.status["lastPosted"] = datetime.now(timezone.utc).isoformat()
                     if force:
                         self.status["lastManualPosted"] = self.status["lastPosted"]
