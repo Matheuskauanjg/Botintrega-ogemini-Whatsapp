@@ -18,6 +18,8 @@ import discord
 import httpx
 from fastapi import Depends
 
+from news_images import find_illustrative_image
+
 CHANNEL_ID = int(os.getenv("CHINA_NEWS_CHANNEL_ID", "1560415874114920559"))
 GUILD_ID = int(os.getenv("CHINA_NEWS_GUILD_ID", "1251266361569710222"))
 MANUAL_COOLDOWN = max(10, int(os.getenv("CHINA_NEWS_MANUAL_COOLDOWN_SECONDS", "30")))
@@ -443,6 +445,25 @@ async def _last_discord_post(channel, own_id: int) -> tuple[float, set[str]]:
     return latest_auto, seen_urls
 
 
+def _image_credit_line(article: dict, portuguese: bool = False) -> str:
+    """A imagem externa é sempre marcada como ilustração, com licença e fonte."""
+    info = article.get("_illustrative")
+    if not info:
+        return ""
+    creator = info["creator"]
+    license_name = info["license"]
+    page = info["url"]
+    if portuguese:
+        return (
+            f"\n🖼️ **Imagem ilustrativa (não é registro do acontecimento).** "
+            f"Crédito: {creator} · {license_name} · <{page}>"
+        )
+    return (
+        f"\n🖼️ 示意配图（非事件现场照片）· {creator} · {license_name}"
+        f" · <{page}>"
+    )
+
+
 def _format_news_post(article: dict, chinese_text: str) -> str:
     """Preserva toda a fonte e o CTA; nunca corta a URL do veículo."""
     footer = (
@@ -450,6 +471,7 @@ def _format_news_post(article: dict, chinese_text: str) -> str:
         f"\n🔗 原文：<{article['url']}>"
         "\n🇧🇷 葡语翻译请查看下方讨论串。"
     )
+    footer += _image_credit_line(article)
     mode = " · 手动发布" if article.get("_manual") else ""
     header = f"{MARKER} · {article['category']}{mode}\n\n**{article['title']}**\n\n"
     room = 1950 - len(header) - len(footer)
@@ -515,6 +537,7 @@ async def _publish(
             f"🗞️ **Fonte:** {article['source'] or 'Noticiário'}\n"
             f"🔗 **Notícia original:** <{article['url']}>\n"
             "ℹ️ Resumo jornalístico reescrito a partir da reportagem original."
+            f"{_image_credit_line(article, portuguese=True)}"
         )
         for chunk in _split_translation(translated):
             await thread.send(chunk)
@@ -604,12 +627,15 @@ class ChinaNewsService:
                     if article["url"] in seen:
                         continue
                     image = await _article_image(http, article)
-                    if not image:
-                        continue
                     # Para escrever um texto longo, a página precisa conter fatos suficientes.
                     body_text = article.get("body_text") or ""
                     if len(re.findall(r"[\u3400-\u9fff]", body_text)) < 220:
                         print(f"[ChinaNews] Conteúdo curto demais: {article['url']}", flush=True)
+                        continue
+                    if not image:
+                        image = await find_illustrative_image(http, article, _download_image)
+                    if not image:
+                        print(f"[ChinaNews] Sem imagem de origem nem alternativa: {article['url']}", flush=True)
                         continue
                     editorial = await self.translator(
                         article["title"], article["description"], body_text
@@ -638,7 +664,7 @@ class ChinaNewsService:
                     self.status["lastArticle"] = article["url"]
                     print(f"[ChinaNews] Publicado ({category}) {article['url']}", flush=True)
                     return {"ok": True, "messageId": str(message_id), "category": category, "url": article["url"]}
-        self.status["lastError"] = "Nenhuma notícia recente com imagem verificável disponível; consulte logs [ChinaNews]"
+        self.status["lastError"] = "Nenhuma notícia recente com imagem original ou ilustrativa validada; consulte logs [ChinaNews]"
         return {"ok": False, "reason": self.status["lastError"]}
 
 
