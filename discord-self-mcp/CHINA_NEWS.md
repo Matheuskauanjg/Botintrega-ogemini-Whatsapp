@@ -8,7 +8,7 @@ Serviço instalado automaticamente pelo módulo `bridge_chain.py` do `discord-se
 - **Intervalo:** 2 horas após a última notícia publicada com sucesso.
 - **Rotatividade:** notícias nacionais (`国内`), regionais (`地方`, alternando províncias) e celebridades/fofocas (`娱乐`).
 - **Fontes:** pesquisas RSS do Bing News e Google News em chinês; o link e o título são extraídos de itens reais, publicados nas últimas 96 horas.
-- **Imagem:** retirada dos metadados da matéria (`og:image` / `twitter:image`) ou da mídia indicada no RSS. A foto é baixada e anexada ao Discord para não depender de hotlink. Sem foto validada, a notícia é ignorada.
+- **Imagem:** retirada dos metadados da matéria (`og:image` / `twitter:image`) ou da mídia indicada no RSS. A foto é baixada e anexada ao Discord para não depender de hotlink. Se a notícia não tiver uma foto válida, o bot pesquisa imagens tematicamente relacionadas no Openverse e Wikimedia Commons (com licenças abertas), baixa a foto e adiciona a identificação **imagem ilustrativa, não é foto do acontecimento**, com autor, licença e link da obra nas versões chinesa e portuguesa. Sem foto original nem alternativa licenciada validada, passa para outra notícia.
 - **Redação expandida:** extrai o conteúdo da reportagem original e gera um resumo autoral em chinês (normalmente 4 a 6 parágrafos, dependendo dos fatos realmente disponíveis). Mantém o post principal abaixo de 2.000 caracteres, com a URL integral e a imagem.
 - **Tradução:** tradução para português brasileiro de todos os parágrafos produzidos em chinês, pelos provedores existentes (Gemini 1, Gemini 2, NVIDIA e Groq, nessa ordem). O tópico pode conter mais de uma mensagem para preservar a tradução completa. Não inventar informações além da reportagem original.
 - **Tópico:** cada mensagem em chinês origina um tópico público com a tradução em português e o mesmo link de fonte.
@@ -24,6 +24,7 @@ CHINA_NEWS_ENABLED=true
 CHINA_NEWS_CHANNEL_ID=1560415874114920559
 CHINA_NEWS_INTERVAL_SECONDS=7200
 CHINA_NEWS_MAX_AGE_HOURS=96
+CHINA_NEWS_EXTERNAL_IMAGES=true
 CHINA_NEWS_DB_PATH=/data/china_news.sqlite3
 ```
 
@@ -46,7 +47,7 @@ Digite no **servidor configurado**:
 - `!noticia provincia` (ou `!noticia província`) — notícia de província chinesa.
 - `!noticia fofoca` — notícia sobre entretenimento, celebridades ou fofocas.
 
-O comando publica no canal de notícias configurado, independentemente do canal onde for enviado, e responde com um link para a mensagem criada. Pula a espera de duas horas, mas **não repete matérias** e não ignora a exigência de imagem, fonte e tradução. Um novo envio manual só pode começar após 30 segundos, por padrão. **A publicação manual não adia mais a publicação automática de duas em duas horas.** O relógio da rotina considera somente as postagens agendadas, inclusive após reinício, consultando o histórico do canal. No status, os campos `lastScheduledPosted` e `nextScheduledDue` mostram o agendamento em UTC.
+O comando publica no canal de notícias configurado, independentemente do canal onde for enviado, e responde com um link para a mensagem criada. Pula a espera de duas horas, mas **não repete matérias** e exige imagem original ou ilustrativa licenciada, fonte e tradução. Um novo envio manual só pode começar após 30 segundos, por padrão. **A publicação manual não adia mais a publicação automática de duas em duas horas.** O relógio da rotina considera somente as postagens agendadas, inclusive após reinício, consultando o histórico do canal. No status, os campos `lastScheduledPosted` e `nextScheduledDue` mostram o agendamento em UTC.
 
 Por segurança, apenas a própria conta conectada, o dono do servidor ou os IDs relacionados em `CHINA_NEWS_ADMIN_IDS` podem ativá-lo. Os demais comandos do Greed são preservados.
 
